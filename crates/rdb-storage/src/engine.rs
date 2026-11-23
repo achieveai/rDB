@@ -376,6 +376,11 @@ pub(crate) struct Marks {
     pub(crate) installing: Option<(Generation, Seq)>,
 }
 
+/// The `History` record size, key plus framed value, [`RocksEngine::history_bytes`] assumes
+/// for a partition with no sample since open when the column family's own estimates are 0 or
+/// missing (lead ruling R25).
+pub const HISTORY_RECORD_BYTES_SEED: u64 = 256;
+
 /// One core set's data engine on RocksDB.
 ///
 /// WAL on, `sync=false` on commit (spec §4.1, §5.2 step 3). Every write and every capture goes
@@ -429,6 +434,11 @@ pub struct RocksEngine {
     /// ([`Self::wal_syncs`]); `None` on a read-only open.
     #[cfg(debug_assertions)]
     options: Option<Options>,
+    /// Issue #61 R25: per partition, the `(bytes, records)` of every `History` record
+    /// [`Self::commit`] and `install_finish` wrote since open, key plus framed value, the
+    /// running mean [`Self::history_bytes`] multiplies by. In memory only: it starts empty at
+    /// every open, so the learning resets at restart.
+    pub(crate) history_sizes: BTreeMap<PartitionId, (u64, u64)>,
 }
 
 /// A storage fault the engine reports at the next matching call instead of calling RocksDB, so
@@ -861,6 +871,7 @@ impl RocksEngine {
             wal_dir_syncs: Arc::default(),
             #[cfg(debug_assertions)]
             options: Some(options),
+            history_sizes: BTreeMap::new(),
         })
     }
 
@@ -908,6 +919,7 @@ impl RocksEngine {
             wal_dir_syncs: Arc::default(),
             #[cfg(debug_assertions)]
             options: None,
+            history_sizes: BTreeMap::new(),
         })
     }
 
@@ -1617,6 +1629,8 @@ impl RocksEngine {
     /// # Errors
     ///
     /// [`StorageFault::WriteFailed`] when RocksDB refuses the write; nothing is applied.
+    /// [`StorageFault::Corrupt`] when a delete on a linked lineage cannot read a lower level's
+    /// record (S5a's point read fails, or its frame does not decode); nothing is applied.
     pub fn commit(&mut self, batch: Batch) -> Result<AppliedSeq, StorageFault> {
         let key = (batch.partition, batch.generation);
         let marks = self.lineages.get(&key).copied().unwrap_or_default();
@@ -1669,14 +1683,23 @@ impl RocksEngine {
         }
         let applied = AppliedSeq(marks.applied.0.max(batch.seq.0));
         let mut write = WriteBatch::default();
+        let mut history = Vec::new();
         for w in &batch.writes {
             let cf = self.cf(keys::cf_for(w.ns));
             let raw = encode_key(batch.partition, batch.generation, w.ns, &w.key);
             match &w.value {
-                Some(value) => write.put_cf(cf, raw, frame(batch.seq.0, value)),
-                // A plain delete would let a read fall through to the parent's key
-                // (ADR-rdb-0010 decision 4).
-                None if marks.link.is_some() => write.put_cf(cf, raw, tombstone(batch.seq.0)),
+                Some(value) => {
+                    let framed = frame(batch.seq.0, value);
+                    if w.ns == Namespace::History {
+                        history.push(raw.len() + framed.len());
+                    }
+                    write.put_cf(cf, raw, framed);
+                }
+                // A plain delete would let a read fall through to a lower level's value, so only
+                // a key some lower level holds gets a tombstone (ADR-rdb-0010 decision 4, S5a).
+                None if self.lower_holds(batch.partition, batch.generation, w.ns, &w.key)? => {
+                    write.put_cf(cf, raw, tombstone(batch.seq.0));
+                }
                 None => write.delete_cf(cf, raw),
             }
         }
@@ -1714,6 +1737,9 @@ impl RocksEngine {
             return Err(StorageFault::WriteFailed);
         }
         self.lineages.insert(key, Marks { applied, ..marks });
+        for bytes in history {
+            self.learn_history_bytes(batch.partition, bytes);
+        }
         if upgrade {
             tracing::info!(
                 target: LOG_TARGET,
@@ -2184,6 +2210,77 @@ impl RocksEngine {
             .map_or(Seq::ZERO, |(_, floor)| floor.seq)
     }
 
+    /// An **estimate** of the bytes of `History` lineage `(partition, generation)` keeps from
+    /// `from` through its applied head (issue #61 S3, lead ruling R25): the retained seqs in
+    /// `[max(from, floor, 1), head]` times the partition's mean record size (the simulator's
+    /// twin is open in #239 and needs owner OK). The cost is the [`Self::floor`] walk, O(lineage levels), and,
+    /// on the cold path while the partition has no learnt mean, two RocksDB property reads
+    /// ([`Self::history_record_bytes`]); no record is read.
+    ///
+    /// The count follows the same chain [`Self::get`] and [`Self::stage_trim_history`] walk: the
+    /// lineage's own level holds `(base, head]` and each parent the seqs at or below the base it
+    /// is reached through, so together they hold one record per seq from seq 1, less what the
+    /// trim floor cut. It assumes that one record per seq (a gap in the seqs counts as a record)
+    /// and roughly uniform record sizes within a partition. Another lineage's records never count.
+    ///
+    /// The mean is key plus framed value, learnt from the records [`Self::commit`] and
+    /// `install_finish` wrote for `partition` since open, kept in memory only, so it resets at
+    /// restart. Until the partition has a sample it is seeded from the `History` column family's
+    /// `estimate-live-data-size / estimate-num-keys` (every partition alike, and an on-disk,
+    /// compressed size), or [`HISTORY_RECORD_BYTES_SEED`] when either is 0 or missing.
+    ///
+    /// Known limit: the mean weighs every record since open alike, so on an engine up for
+    /// months a shift in record size moves it slowly, and the estimate lags the new size for as
+    /// long as the old records dominate the sample.
+    ///
+    /// No `Progress` bytes count: RocksDB keeps only the head's. The
+    /// retention cap (`rdb_core::replication::retention::cap_seq`) needs only that the answer
+    /// never grows as `from` or the floor rises, which holds for any fixed mean. 0 when `from`
+    /// is above the head, or the lineage is unknown.
+    #[must_use]
+    pub fn history_bytes(&self, partition: PartitionId, generation: Generation, from: Seq) -> u64 {
+        let head = self.buffered_applied(partition, generation).0;
+        let low = from.0.max(self.floor_seq(partition, generation).0).max(1);
+        if low > head {
+            return 0;
+        }
+        (head - low + 1).saturating_mul(self.history_record_bytes(partition))
+    }
+
+    /// The mean `History` record size [`Self::history_bytes`] multiplies by, in bytes: the
+    /// partition's running mean since open, else the seed it documents. Never 0.
+    #[must_use]
+    pub fn history_record_bytes(&self, partition: PartitionId) -> u64 {
+        if let Some(mean) = self
+            .history_sizes
+            .get(&partition)
+            .and_then(|&(bytes, records)| bytes.checked_div(records))
+        {
+            return mean.max(1);
+        }
+        let cf = self.cf(CF_HISTORY);
+        let read = |name| self.db.property_int_value_cf(cf, name).ok().flatten();
+        match (
+            read(rocksdb::properties::ESTIMATE_LIVE_DATA_SIZE),
+            read(rocksdb::properties::ESTIMATE_NUM_KEYS),
+        ) {
+            (Some(bytes), Some(keys)) if bytes > 0 => bytes
+                .checked_div(keys)
+                .map_or(HISTORY_RECORD_BYTES_SEED, |mean| mean.max(1)),
+            _ => HISTORY_RECORD_BYTES_SEED,
+        }
+    }
+
+    /// Add one written `History` record of `bytes` (key plus framed value) to `partition`'s
+    /// running mean.
+    pub(crate) fn learn_history_bytes(&mut self, partition: PartitionId, bytes: usize) {
+        let sample = self.history_sizes.entry(partition).or_insert((0, 0));
+        sample.0 = sample
+            .0
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        sample.1 = sample.1.saturating_add(1);
+    }
+
     /// Delete lineage `(partition, generation)`'s History below `floor.seq` and write `floor`
     /// as its trim mark, in one atomic `WriteBatch`, staged unsynced (issue #61, A-R317): the
     /// trim is durable only after the next WAL sync that begins after this returns, so a node's
@@ -2476,6 +2573,26 @@ impl RocksEngine {
             }
             level = link.parent;
         }
+    }
+
+    /// Whether a read of `key` in `ns` at lineage `(partition, generation)` that finds nothing on
+    /// the own level reaches a value on a lower level: [`Self::get`]'s walk from the first link.
+    /// One point read per level reached.
+    fn lower_holds(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        ns: Namespace,
+        key: &[u8],
+    ) -> Result<bool, StorageFault> {
+        let Some(link) = self.link(partition, generation) else {
+            return Ok(false);
+        };
+        let falls_through = match ns {
+            Namespace::History => decode_mark(key).is_some_and(|seq| seq <= link.base.0),
+            _ => !link.copied,
+        };
+        Ok(falls_through && self.get(partition, link.parent, ns, key)?.is_some())
     }
 
     /// The link of lineage `(partition, generation)`, `None` for a lineage with no parent.

@@ -61,6 +61,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
         tail_refused: None,
         possible_loss: None,
         needs_operator: None,
+        members_revision: None,
     }
 }
 
@@ -1448,6 +1449,161 @@ fn own81_bad_partition_entry_warns_once() {
         &ControlKey::Partition(PartitionId(5)).encode(),
         "partition_entry_undecodable",
     );
+}
+
+/// #80 S3 B1: [`write_outage_bound`] is the documented sum. At the spec defaults, with the
+/// default `Timeouts` and `Failover` and the probe's 1 s put: owner 12.05 s, kill copy 13.45 s,
+/// silent copy 15.65 s (critic B-1). Each input moves the terms that name it by exactly its own
+/// change, and no other. `acceptance()` is ruling Q1's 15 s and, under the owner's B-1 ruling
+/// (a), gates the owner and kill-copy classes only, each of which fits under it; the silent
+/// class has the stated 17 s and the 25 s hard ceiling of `silent()`. Each
+/// expected budget sits inside the code ceiling it stands in for (critic S-8). Unit.
+///
+/// Cut (a): drop `failover.poll` from the owner sum; red at the owner default (11.55 s, not
+/// 12.05 s), observed 2026-11-20. Cut (b): `secondary_silent` set to the kill term, leaving the
+/// silent clock out; red at the silent default (13.45 s, not 15.65 s), observed 2026-11-20.
+/// Cut (c): `SecondarySilent` added to `acceptance()`'s gated list; red at the gated-list
+/// assertion, observed 2026-11-20.
+#[test]
+fn s80s3_write_outage_bound_is_the_documented_sum() {
+    let ms = Duration::from_millis;
+    let budgets = Budgets::SPEC_DEFAULTS;
+    let timeouts = crate::db::Timeouts::default();
+    let failover = Failover::default();
+    let put = PROBE_PUT_TIMEOUT;
+    let bound = write_outage_bound(&budgets, &timeouts, &failover, put);
+    assert_eq!(bound.owner, ms(12_050), "owner");
+    assert_eq!(bound.secondary_kill, ms(13_450), "secondary_kill");
+    assert_eq!(bound.secondary_silent, ms(15_650), "secondary_silent");
+    assert_eq!(bound.retry, ms(1_250), "retry");
+
+    // Each input moves exactly the terms that name it, by its own change: (owner, kill, silent).
+    let moved = |changed: OutageBound, by: (u64, u64, u64), input: &str| {
+        let delta = |after: Duration, before: Duration| {
+            u64::try_from(after.saturating_sub(before).as_millis()).unwrap_or(u64::MAX)
+        };
+        assert_eq!(
+            (
+                delta(changed.owner, bound.owner),
+                delta(changed.secondary_kill, bound.secondary_kill),
+                delta(changed.secondary_silent, bound.secondary_silent),
+            ),
+            by,
+            "{input}"
+        );
+    };
+    let with = |b: Budgets| write_outage_bound(&b, &timeouts, &failover, put);
+    moved(
+        with(Budgets {
+            grant_millis: budgets.grant_millis + 7,
+            ..budgets
+        }),
+        (7, 0, 0),
+        "grant",
+    );
+    moved(
+        with(Budgets {
+            clock_error_millis: budgets.clock_error_millis + 7,
+            ..budgets
+        }),
+        (14, 0, 0),
+        "epsilon, twice",
+    );
+    moved(
+        with(Budgets {
+            dispatch_margin_millis: budgets.dispatch_margin_millis + 7,
+            ..budgets
+        }),
+        (7, 0, 0),
+        "delta",
+    );
+    moved(
+        with(Budgets {
+            pause_age_millis: budgets.pause_age_millis + 7,
+            ..budgets
+        }),
+        (0, 0, 7),
+        "pause age",
+    );
+    let slower_poll = Failover {
+        poll: failover.poll + ms(7),
+        ..failover
+    };
+    moved(
+        write_outage_bound(&budgets, &timeouts, &slower_poll, put),
+        (7, 0, 0),
+        "poll",
+    );
+    let slower = |t: crate::db::Timeouts| write_outage_bound(&budgets, &t, &failover, put);
+    moved(
+        slower(crate::db::Timeouts {
+            read: timeouts.read + ms(7),
+            ..timeouts
+        }),
+        (7, 0, 0),
+        "read",
+    );
+    moved(
+        slower(crate::db::Timeouts {
+            unreachable_drop_after: timeouts.unreachable_drop_after + ms(7),
+            ..timeouts
+        }),
+        (0, 7, 0),
+        "unreachable_drop_after",
+    );
+    moved(
+        write_outage_bound(&budgets, &timeouts, &failover, put + ms(7)),
+        (7, 7, 7),
+        "put",
+    );
+    // The fixed terms, by name: a dropped one is red at the defaults above as well.
+    assert_eq!(
+        bound.secondary_silent,
+        ms(budgets.pause_age_millis)
+            + ms(crate::host::DROP_CHECK_EVERY_MILLIS)
+            + ms(crate::host::PEER_DROP_AFTER_MILLIS)
+            + ms(crate::host::DROP_CHECK_EVERY_MILLIS)
+            + REPLAN_BUDGET
+            + bound.retry,
+        "the silent sum by name"
+    );
+
+    // Ruling Q1, under B-1 choice (a).
+    let (limit, gates) = bound.acceptance();
+    assert_eq!(limit, ms(15_000), "ruling Q1");
+    assert_eq!(
+        gates,
+        [OutageClass::Owner, OutageClass::SecondaryKill],
+        "B-1 (a): a kill is gated, silence is reported"
+    );
+    for class in gates {
+        assert!(
+            bound.of(*class) <= limit,
+            "{}: {:?} over the {limit:?} it is gated by",
+            class.word(),
+            bound.of(*class)
+        );
+    }
+    assert!(
+        bound.secondary_silent > limit,
+        "B-1 is moot if the silent class fits: {:?}",
+        bound.secondary_silent
+    );
+    // The B-1 ruling, option (a): the silent class reported against about 17 s, failed above a
+    // loose 25 s, and its expected sum under both.
+    let (stated, ceiling) = bound.silent();
+    assert_eq!(
+        (stated, ceiling),
+        (ms(17_000), ms(25_000)),
+        "B-1 (a) figures"
+    );
+    assert!(bound.secondary_silent <= stated && stated < ceiling);
+
+    // Critic S-8: each expected budget inside the code ceiling it stands in for.
+    assert_eq!(bound.ceilings.promote_within, ms(16_200), "heal_within");
+    assert!(PROMOTE_BUDGET <= bound.ceilings.promote_within, "promote");
+    assert!(bound.retry >= bound.ceilings.put, "retry");
+    assert_eq!(bound.ceilings.put, put, "the probe's put timeout");
 }
 
 /// #81 X2: `grants/1` as a frozen record of node 1's boot `boot`, its expiry long past.

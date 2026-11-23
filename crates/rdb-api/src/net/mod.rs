@@ -156,7 +156,16 @@ use self::wire::{Frame, Hello, Inbound, Label, Outbound, WireAnswer, WireMsg, Wi
 /// commit that merged main in before the gate (ADR-rdb-0009 section 7). The upgrade is the same
 /// as for `10`: every node and every linked app process together.
 ///
-/// `13` came with #177: `WireCall::AckPossibleLoss` is new, `WireNodeStatus` gains
+/// `13` came with #244 (#80 S4) (membership and refill): `WireNodeStatus::members_revision`, the
+/// `nodes/` revision a node's membership watcher last applied, and `WireCall::Refill`. Each is
+/// added after main's fields and variants, so theirs keep their positions. A frame is
+/// positional postcard, so a build at 12 cannot read a status from 13; the handshake refuses
+/// the pair instead. `remove_node` relies on that: a member counts as current only once a
+/// status from it has arrived since its boot, which a build without layout 3 cannot send. The
+/// number is main's 12 + 1, set by the commit that merged main in. The upgrade is the same as
+/// for `10`: every node and every linked app process together.
+///
+/// `14` came with #238 (#177): `WireCall::AckPossibleLoss` is new, `WireNodeStatus` gains
 /// `possible_loss`, and `WireHolding` gains `restored` and makes `owner_epoch` optional (`None`
 /// for a holding reported from a restored store). The number is main's version + 1, set in its
 /// own one-line commit after the pre-gate main merge, just before merging to main. The upgrade
@@ -342,6 +351,12 @@ struct Shared {
     /// This process's clock, the one its [`Links`] owns.
     clock: HostClock,
     routes: Mutex<BTreeMap<NodeId, Route>>,
+    /// The live members (#80 S4, B-2): the nodes whose links this process takes. The boot peer
+    /// list and this node at start; [`Net::set_members`] from the `nodes/` records after. A
+    /// node's handshake from any other id is refused (`refusal`).
+    members: Mutex<BTreeSet<NodeId>>,
+    /// The `nodes/` revision [`Net::set_members`] last applied; 0 before any.
+    members_revision: AtomicU64,
     conns: Mutex<BTreeMap<u64, Arc<Conn>>>,
     next_conn: AtomicU64,
     rt: tokio::runtime::Handle,
@@ -424,6 +439,8 @@ impl Net {
                     })
                     .collect(),
             ),
+            members: Mutex::new(boot_members(&config.label, &config.peers)),
+            members_revision: AtomicU64::new(0),
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             rt: tokio::runtime::Handle::current(),
@@ -439,6 +456,7 @@ impl Net {
         if !config.peers.is_empty() {
             let k = config.peers.len() + usize::from(matches!(config.label, Label::Node(_)));
             if let Some(guard) = links.clock().guard() {
+                guard.set_members(&lock(&shared.members));
                 guard.attach(k);
             }
         }
@@ -524,6 +542,115 @@ impl Net {
     #[must_use]
     pub const fn addr(&self) -> Option<std::net::SocketAddr> {
         self.addr
+    }
+
+    /// Admit the live members the `nodes/` records name at `revision` (#80 S4, B-2): a node in
+    /// `live` gets a route, so its handshake is welcomed and installed, and the clock guard
+    /// counts its verdicts and takes K as the live members plus any id still linked (ruling
+    /// R8-7). A node outside `live` is refused at the handshake from now on, and is retired
+    /// here: its route goes, so it is dialled no more, its open links are closed, the clock
+    /// guard drops its verdict, and K shrinks to the members left (a layout 3 record,
+    /// `remove_node`). This node is always a member of its own set. Logged `net_members_set`
+    /// when the set changes.
+    pub fn set_members(&self, live: &BTreeSet<NodeId>, revision: u64) {
+        let shared = &self.shared;
+        let own = match &shared.label {
+            Label::Node(own) => Some(*own),
+            Label::App(_) => None,
+        };
+        let members: BTreeSet<NodeId> = live.iter().copied().chain(own).collect();
+        // #80 S4 (B-2): the members are set before any link is closed, so a retired node's
+        // dial back is refused by `refusal` and the dial loop here stops dialling it.
+        let changed = {
+            let mut held = lock(&shared.members);
+            let changed = *held != members;
+            held.clone_from(&members);
+            changed
+        };
+        let (added, retired, linked) = {
+            let mut routes = lock(&shared.routes);
+            let mut added = Vec::new();
+            let retired: Vec<u32> = routes
+                .keys()
+                .filter(|node| !members.contains(node))
+                .map(|node| node.0)
+                .collect();
+            routes.retain(|node, _| members.contains(node));
+            for node in members.iter().filter(|node| Some(**node) != own) {
+                if !routes.contains_key(node) {
+                    routes.insert(
+                        *node,
+                        Route {
+                            conn: None,
+                            queue: VecDeque::new(),
+                            boot: None,
+                            refused: None,
+                            last_error: None,
+                        },
+                    );
+                    added.push(node.0);
+                }
+            }
+            let linked: BTreeSet<NodeId> = routes
+                .iter()
+                .filter(|(_, route)| route.conn.is_some())
+                .map(|(node, _)| *node)
+                .collect();
+            (added, retired, linked)
+        };
+        // Never under the routes lock: `close` takes it.
+        let stale: Vec<Arc<Conn>> = lock(&shared.conns)
+            .values()
+            .filter(|conn| matches!(conn.peer, Label::Node(node) if !members.contains(&node)))
+            .cloned()
+            .collect();
+        for conn in &stale {
+            close(
+                shared,
+                conn,
+                "not a live member: its nodes/ record is removed",
+            );
+        }
+        shared.members_revision.store(revision, Ordering::Relaxed);
+        let k = members.union(&linked).count();
+        if let Some(guard) = shared.clock.guard() {
+            guard.set_members(&members);
+            if k > 1 {
+                guard.attach(k);
+            }
+        }
+        if changed || !added.is_empty() || !retired.is_empty() {
+            let live: Vec<u32> = members.iter().map(|node| node.0).collect();
+            tracing::info!(
+                revision, live = ?live, added = ?added, retired = ?retired, closed = stale.len(),
+                k, "net_members_set"
+            );
+        }
+    }
+
+    /// The nodes this process holds an open link to, whatever its routes say: the
+    /// connections themselves, for rows (#80 S4).
+    #[cfg(test)]
+    pub(crate) fn linked_peers(&self) -> BTreeSet<NodeId> {
+        lock(&self.shared.conns)
+            .values()
+            .filter_map(|conn| match &conn.peer {
+                Label::Node(node) => Some(*node),
+                Label::App(_) => None,
+            })
+            .collect()
+    }
+
+    /// The live members this process takes links from ([`Self::set_members`]).
+    #[must_use]
+    pub fn members(&self) -> BTreeSet<NodeId> {
+        lock(&self.shared.members).clone()
+    }
+
+    /// The `nodes/` revision [`Self::set_members`] last applied; 0 before any (#80 S4).
+    #[must_use]
+    pub fn members_revision(&self) -> u64 {
+        self.shared.members_revision.load(Ordering::Relaxed)
     }
 
     /// Call `observer(node, boot)` whenever a node's link comes up at a boot not seen before
@@ -802,6 +929,11 @@ impl Net {
             links: std::sync::Weak::new(),
             clock: HostClock::start(),
             routes: Mutex::new(peers.iter().map(|peer| (*peer, route())).collect()),
+            members: Mutex::new(boot_members(
+                &Label::Node(node),
+                &peers.iter().copied().collect(),
+            )),
+            members_revision: AtomicU64::new(0),
             conns: Mutex::new(BTreeMap::new()),
             next_conn: AtomicU64::new(0),
             rt,
@@ -1267,6 +1399,7 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 call:
                     call @ (wire::WireCall::Move { .. }
                     | wire::WireCall::Rebuild { .. }
+                    | wire::WireCall::Refill { .. }
                     | wire::WireCall::ForgetTail { .. }
                     | wire::WireCall::AckPossibleLoss { .. }),
                 to,
@@ -1275,6 +1408,7 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
         ) if !admin_apps.contains(app) => {
             let (verb, step) = match call {
                 wire::WireCall::Move { .. } => ("move", crate::db::error::MOVE_STEP),
+                wire::WireCall::Refill { .. } => ("refill", crate::db::error::REFILL_STEP),
                 wire::WireCall::ForgetTail { .. } => {
                     ("forget-tail", crate::db::error::FORGET_TAIL_STEP)
                 }
@@ -1292,7 +1426,7 @@ fn sender_refused(peer: &Label, msg: &WireMsg, admin_apps: &BTreeSet<String>) ->
                 format!(" or run the {verb} as an admin app (`lr` runs it as `admin`)")
             };
             return Some(format!(
-                "app {app} is not an admin app on node {}: only an admin app may move or \
+                "app {app} is not an admin app on node {}: only an admin app may move, refill or \
                  rebuild a copy, forget a tail or ack a possible loss, and the node's operator \
                  names them; add {app} \
                  to the node's admin apps (`rdb_node --admin-apps`, \
@@ -1608,6 +1742,11 @@ async fn dial(shared: Arc<Shared>, node: NodeId, address: String, tls: config_gr
     let mut reported: Option<String> = None;
     loop {
         serving(&shared).await;
+        // #80 S4: a retired node is not dialled; it would be refused at its first frame anyway.
+        if !lock(&shared.members).contains(&node) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
         unmuted(&shared, node).await;
         let reason = match dial_once(&shared, node, &address, &tls).await {
             Ok(reason) => {
@@ -1943,5 +2082,23 @@ fn refusal(shared: &Shared, label: &Label, hello: &Hello) -> Option<String> {
             hello.label
         ));
     }
+    if let Label::Node(node) = label {
+        if !lock(&shared.members).contains(node) {
+            return Some(format!(
+                "{label} is not a live member of {}'s database: node {} has no nodes/ record \
+                 this node has applied yet; it is dialled again",
+                shared.label, node.0
+            ));
+        }
+    }
     None
+}
+
+/// A process's members at start: its boot peers, and itself for a node.
+fn boot_members(label: &Label, peers: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
+    let own = match label {
+        Label::Node(own) => Some(*own),
+        Label::App(_) => None,
+    };
+    peers.iter().copied().chain(own).collect()
 }

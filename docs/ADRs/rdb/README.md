@@ -40,6 +40,7 @@ ADR that supersedes.
 | [0022](0022-formation-by-declaration.md) | Formation by declaration — each node forms its own partitions from its own folder (extends 0008) | Proposed |
 | [0023](0023-node-records-ring-placement-one-node-per-machine.md) | Node records, ring placement, one node per machine (amends 0008 and 0022) | Proposed |
 | [0024](0024-tls-to-the-control-store.md) | TLS to the control store — plaintext to rEtcd only when every node is on a loopback IP (extends 0023) | Proposed |
+| [0025](0025-failover-when-one-host-is-lost.md) | Failover when one host is lost — the write-outage bound per class: crash writable within 15 s, hang about 17 s (extends 0007 and 0023) | Proposed |
 | [0026](0026-check-b-at-adoption.md) | Check B at adoption (supersedes 0021 decision 7) | **Accepted** |
 | [0027](0027-history-trim-floor-and-snapshot-rebuild.md) | History trim floor and snapshot rebuild — History kept from a per-lineage floor; a copy behind it is rebuilt from a state snapshot (extends 0010) | Proposed |
 | [0028](0028-reopen-heal-on-a-majority-within-one-os-boot.md) | Reopen heal on a majority within one OS boot — only with `live_readd` on (extends 0009, amends 0022) | Proposed |

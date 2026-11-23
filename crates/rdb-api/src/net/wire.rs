@@ -948,6 +948,11 @@ pub enum WireCall {
         from: WireFeedCursor,
         max: u32,
     },
+    // #80 S4 (A-R456 narrowed: refill): added after main's variants, under protocol 13.
+    Refill {
+        identity: RequestIdentity,
+        to: NodeId,
+    },
     // #177: added last, with #177's protocol version, so the variants above keep their index.
     AckPossibleLoss {
         identity: RequestIdentity,
@@ -970,6 +975,7 @@ impl WireCall {
             | Self::Rebuild { identity, .. }
             | Self::ForgetTail { identity, .. }
             | Self::Changes { identity, .. }
+            | Self::Refill { identity, .. }
             | Self::AckPossibleLoss { identity, .. } => Some(*identity),
             Self::Resend { request } => Some(request.identity),
             Self::WaitDurable { .. } => None,
@@ -991,6 +997,7 @@ impl WireCall {
             Self::WaitDurable { .. } => "wait_durable",
             Self::ForgetTail { .. } => "forget_tail",
             Self::Changes { .. } => "changes",
+            Self::Refill { .. } => "refill",
             Self::AckPossibleLoss { .. } => "ack_possible_loss",
         }
     }
@@ -1059,6 +1066,10 @@ impl TryFrom<&ClientCall> for WireCall {
             ClientCall::Rebuild { identity, node } => Self::Rebuild {
                 identity: *identity,
                 node: *node,
+            },
+            ClientCall::Refill { identity, to } => Self::Refill {
+                identity: *identity,
+                to: *to,
             },
             ClientCall::ForgetTail {
                 identity,
@@ -1151,6 +1162,7 @@ impl TryFrom<WireCall> for ClientCall {
             },
             WireCall::Move { identity, from, to } => Self::Move { identity, from, to },
             WireCall::Rebuild { identity, node } => Self::Rebuild { identity, node },
+            WireCall::Refill { identity, to } => Self::Refill { identity, to },
             WireCall::ForgetTail {
                 identity,
                 through,
@@ -2279,10 +2291,12 @@ pub struct WireNodeStatus {
     pub committed_without: rdb_core::contracts::recovery::NoteState,
     /// Added under version 8 (#79 S4d): why a repair cannot take this copy back.
     pub tail_refused: Option<WireTailRefused>,
-    /// Added with #177's protocol version: the partition's possible-loss record on this node.
-    pub possible_loss: Option<WirePossibleLoss>,
     /// Added by #61's protocol version (rev 5 M1): the command an operator must run.
     pub needs_operator: Option<String>,
+    /// Added under protocol 13 (#80 S4): [`NodeStatus::members_revision`].
+    pub members_revision: Option<u64>,
+    /// Added with #177's protocol version: the partition's possible-loss record on this node.
+    pub possible_loss: Option<WirePossibleLoss>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -2406,6 +2420,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                 reason: loss.reason,
             }),
             needs_operator: status.needs_operator.clone(),
+            members_revision: status.members_revision,
         }
     }
 }
@@ -2471,6 +2486,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
                 .transpose()?,
             needs_operator: status.needs_operator,
             lengths: None,
+            members_revision: status.members_revision,
             possible_loss: status.possible_loss.map(|loss| crate::host::PossibleLoss {
                 copy: loss.copy,
                 generation: loss.generation,

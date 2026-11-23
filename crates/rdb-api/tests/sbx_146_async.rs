@@ -118,6 +118,8 @@ where
         boot: None,
         storage: rdb_api::StorageOptions::default(),
         addresses: None,
+        history_budget_bytes: None,
+        history_keep: None,
     };
     let handle = rt.handle().clone();
     rt.block_on(async move {

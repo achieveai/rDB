@@ -438,6 +438,8 @@ mod tests {
             timeouts: Timeouts::default(),
             dedup_cap: None,
             dedup_retention: None,
+            history_keep: None,
+            history_budget_bytes: None,
             local: ALL_NODES.to_vec(),
             links: None,
             client: DEFAULT_CLIENT,

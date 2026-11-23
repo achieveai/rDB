@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Entry point of the rdb-bf-node image. Roles:
-#   voter [config-server args]   exec config-server as given (bring your own config.toml)
+#   voter [config-server args]   exec config-server as given (bring your own config.toml).
+#                                With RDB_FORM_IF_FRESH=1 (#80 S3 G1) it adds --form only when
+#                                the voter's data folder (RDB_VOTER_DATA, default /data/voter,
+#                                the data_dir voter-init writes) is absent or empty, so the voter
+#                                that forms the cluster can be restarted on its volume.
 #   dev-voter                    one self-contained insecure single-voter rEtcd for development:
 #                                generates the signed manifest and config under $RDB_DIR once,
 #                                then runs config-server. Never for production (no TLS, allow-all).
@@ -24,7 +28,36 @@ role="${1:-help}"
 [ $# -gt 0 ] && shift || true
 
 case "$role" in
-  voter) exec config-server "$@" ;;
+  voter)
+    form=()
+    case "${RDB_FORM_IF_FRESH:-0}" in
+      0) ;;
+      1)
+        for arg in "$@"; do
+          [ "$arg" != --form ] || {
+            echo "rdb-entrypoint: voter: --form and RDB_FORM_IF_FRESH=1 together; give one" >&2
+            exit 2; }
+        done
+        data="${RDB_VOTER_DATA:-/data/voter}"
+        if [ -e "$data" ] && [ ! -d "$data" ]; then
+          echo "rdb-entrypoint: voter: $data is not a folder" >&2; exit 2
+        fi
+        listing=""
+        if [ -d "$data" ]; then
+          listing="$(ls -A "$data")" || {
+            echo "rdb-entrypoint: voter: cannot list $data" >&2; exit 2; }
+        fi
+        if [ -z "$listing" ]; then
+          form=(--form)
+          echo "rdb-entrypoint voter form=yes data=$data (fresh)" >&2
+        else
+          echo "rdb-entrypoint voter form=no data=$data (holds a store)" >&2
+        fi
+        ;;
+      *) echo "rdb-entrypoint: voter: RDB_FORM_IF_FRESH is 0 or 1, not '$RDB_FORM_IF_FRESH'" >&2
+         exit 2 ;;
+    esac
+    exec config-server "$@" "${form[@]}" ;;
   data) exec rdb_node "$@" ;;
   dev) exec rdb_dev "$@" ;;
   voter-init)

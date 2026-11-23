@@ -827,6 +827,10 @@ impl Primary {
     pub(crate) fn await_snapshot(&mut self, copy: CopyId) -> EffectKind {
         let head = self.tracker.head();
         let started = !self.cursors.contains_key(&copy);
+        let was_catching_up = self
+            .cursors
+            .get(&copy)
+            .is_some_and(CatchupCursor::catching_up);
         self.cursors
             .entry(copy)
             .or_insert_with(|| CatchupCursor::new(copy))
@@ -836,6 +840,7 @@ impl Primary {
             copy = copy.0,
             head = head.0,
             started,
+            was_catching_up,
             "r1.snapshot_cursor_awaiting"
         );
         EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {

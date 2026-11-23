@@ -28,6 +28,16 @@
 //! [`MAX_APP_ADDR_LEN`] ([`app_addr_refusal`]), so the cap can rise without a new layout.
 //! [`NodeRecord::decode`] reads both layouts as the declared fields alone, so a record with an
 //! app address equals the one the declaration wrote.
+//!
+//! # Layout 3 (#80 S4): removed
+//!
+//! Layout 2's bytes after a version byte of `[3]`, its app address length 0 when the node held
+//! none, then one state byte, `1` = removed; any other state byte is undecodable. `remove_node`
+//! writes it, a CAS at the revision it read, and it is terminal: no writer puts a layout 1 or 2
+//! body over it, and node ids are never reused. [`NodeRecord::decode`] and
+//! [`NodeRecord::decode_with_app`] answer `None` for it, so a reader that knows only live
+//! records refuses a removed one rather than taking it as live;
+//! [`NodeRecord::decode_removed`] reads it.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -40,6 +50,12 @@ const LAYOUT_VERSION: u8 = 1;
 
 /// The version byte of layout 2: layout 1's fields and an app address (#83 B2).
 const LAYOUT_APP: u8 = 2;
+
+/// The version byte of layout 3: layout 2's fields and a state byte (#80 S4).
+const LAYOUT_REMOVED: u8 = 3;
+
+/// Layout 3's only state byte: the node was removed.
+const STATE_REMOVED: u8 = 1;
 
 /// The longest app address a node writes, in bytes (#83 B2, lead decision 2026-11-19): a
 /// 253-byte DNS name, a port and a scheme or path fit.
@@ -285,6 +301,48 @@ impl NodeRecord {
         Bytes::from(out)
     }
 
+    /// Layout 3: this record removed, keeping `app`, the app address it held (#80 S4). Built
+    /// from the live record `remove_node` read, so `route` still reads the address.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::encode_with_app`].
+    #[must_use]
+    pub fn encode_removed(&self, app: Option<&str>) -> Bytes {
+        let app = app.unwrap_or_default();
+        let len = u16::try_from(app.len()).expect("an app address of at most 65535 bytes");
+        let mut out = self.encode().to_vec();
+        out[0] = LAYOUT_REMOVED;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(app.as_bytes());
+        out.push(STATE_REMOVED);
+        Bytes::from(out)
+    }
+
+    /// The fields and the app address a layout 3 body holds: `None` for any other layout, a
+    /// state byte other than removed, and every body [`Self::decode_with_app`] refuses for its
+    /// layout 2 fields, except that an app address of length 0 is `None`, not undecodable.
+    #[must_use]
+    pub fn decode_removed(body: &[u8]) -> Option<(Self, Option<String>)> {
+        let (&version, rest) = body.split_first()?;
+        let (&state, fields) = rest.split_last()?;
+        if version != LAYOUT_REMOVED || state != STATE_REMOVED {
+            return None;
+        }
+        let mut live = Vec::with_capacity(body.len());
+        live.push(LAYOUT_APP);
+        live.extend_from_slice(fields);
+        if let Some(found) = Self::decode_with_app(&live) {
+            return Some(found);
+        }
+        // Layout 2 holds no empty app address; layout 3 writes length 0 for none.
+        let none = fields.strip_suffix(&[0, 0][..])?;
+        live.truncate(1);
+        live.extend_from_slice(none);
+        live[0] = LAYOUT_VERSION;
+        Self::decode_with_app(&live).map(|(record, _)| (record, None))
+    }
+
     /// The declared fields `body` holds, in layout 1 or 2: `None` for another version, a short
     /// or long body, an empty or non-UTF-8 address or app address, or a machine
     /// [`machine_refusal`] refuses. An app address is not one of them: see
@@ -404,6 +462,98 @@ mod tests {
         assert!(app_addr_refusal("").is_some());
         assert!(app_addr_refusal(&long).is_some());
         assert_eq!(app_addr_refusal(&long[1..]), None);
+    }
+
+    /// M1 (#80 S4, layout 3): a removed record's bytes are pinned as a literal, with and
+    /// without an app address. `encode_removed` of a layout 1 record and of a layout 2 one
+    /// round-trips through `decode_removed`, keeping the app address; layouts 1 and 2 encode as
+    /// before. `decode` and `decode_with_app` answer `None` for layout 3, so no reader that knows
+    /// only live records takes a removed one as live, and `decode_removed` answers `None` for
+    /// layouts 1 and 2. A state byte other than 1, a missing state byte, a trailing byte and a
+    /// short app address are undecodable. Cut: `decode_removed` ignores the state byte's value,
+    /// red at "state byte 0", observed 2026-11-20. Unit.
+    #[test]
+    fn s80s4_node_record_layout_3_round_trips_and_keeps_the_app_address() {
+        let record = NodeRecord {
+            node: NodeId(3),
+            addr: "127.0.0.3:7100".to_owned(),
+            machine: "rack1-b".to_owned(),
+        };
+        let mut fields = vec![3, 0, 0, 0, 14];
+        fields.extend_from_slice(b"127.0.0.3:7100");
+        fields.push(7);
+        fields.extend_from_slice(b"rack1-b");
+        let mut with_app = vec![3];
+        with_app.extend_from_slice(&fields);
+        with_app.extend_from_slice(&[9, 0]);
+        with_app.extend_from_slice(b"gw-3:8443");
+        with_app.push(1);
+        let mut without = vec![3];
+        without.extend_from_slice(&fields);
+        without.extend_from_slice(&[0, 0, 1]);
+        assert_eq!(
+            record.encode_removed(Some("gw-3:8443")).as_ref(),
+            with_app.as_slice()
+        );
+        assert_eq!(record.encode_removed(None).as_ref(), without.as_slice());
+
+        // From the live record remove_node read: layout 2 keeps its address, layout 1 has none.
+        let layout_2 = record.encode_with_app("gw-3:8443");
+        let (read, app) = NodeRecord::decode_with_app(&layout_2).expect("layout 2 reads");
+        assert_eq!(
+            NodeRecord::decode_removed(&read.encode_removed(app.as_deref())),
+            Some((record.clone(), Some("gw-3:8443".to_owned())))
+        );
+        let layout_1 = record.encode();
+        let (read, app) = NodeRecord::decode_with_app(&layout_1).expect("layout 1 reads");
+        assert_eq!(
+            NodeRecord::decode_removed(&read.encode_removed(app.as_deref())),
+            Some((record.clone(), None))
+        );
+        assert_eq!(layout_1[0], 1, "layout 1 is unchanged");
+        assert_eq!(layout_2[0], 2, "layout 2 is unchanged");
+
+        for body in [&with_app, &without] {
+            assert_eq!(
+                NodeRecord::decode(body),
+                None,
+                "a live reader refuses layout 3"
+            );
+            assert_eq!(NodeRecord::decode_with_app(body), None);
+        }
+        assert_eq!(
+            NodeRecord::decode_removed(&layout_1),
+            None,
+            "layout 1 is live"
+        );
+        assert_eq!(
+            NodeRecord::decode_removed(&layout_2),
+            None,
+            "layout 2 is live"
+        );
+
+        for (what, body) in [
+            (
+                "state byte 0",
+                [&with_app[..with_app.len() - 1], &[0]].concat(),
+            ),
+            (
+                "state byte 2",
+                [&with_app[..with_app.len() - 1], &[2]].concat(),
+            ),
+            (
+                "state byte 255",
+                [&without[..without.len() - 1], &[255]].concat(),
+            ),
+            ("no state byte", with_app[..with_app.len() - 1].to_vec()),
+            ("a trailing byte", [&with_app[..], &[1]].concat()),
+            (
+                "an app address cut short",
+                [&with_app[..with_app.len() - 2], &[1]].concat(),
+            ),
+        ] {
+            assert_eq!(NodeRecord::decode_removed(&body), None, "{what}");
+        }
     }
 
     /// b2_2 (#83 B2, PR #159 review): the public cap is 512 **bytes**, pinned by literals so a

@@ -181,6 +181,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: rdb_api::db::ALL_NODES.to_vec(),
         links: None,
         client: rdb_api::db::DEFAULT_CLIENT,
@@ -723,6 +725,204 @@ A peer sees every link to the old boot end, and its dials refused while nothing 
 the new boot's links come up it reads a boot it has not seen on them (`net_peer_booted`), and
 the partitions' owners re-add the node as a regular copy. Nothing else in the process needs to
 restart: the control store, the runtime and your app's own state stay as they are.
+
+### When a host is lost: automatic failover
+
+Start each node process with `rdb_node --failover` (`DbConfig::failover`). Then a lost host
+does not need an operator. The design and the measurements are in ADR-rdb-0025.
+
+**How long writes stop.** A partition stops taking writes for a while. How long depends on
+what the lost host was to it. These are the expected times at the default settings:
+
+| The lost host was the partition's | It ended (crash, `kill`) | It went silent (hang, pause) |
+|---|---|---|
+| owner | about 12 s | about 12 s |
+| copy (secondary) | about 13.5 s | about 17 s |
+| neither | no stop | no stop |
+
+- **A crash: every partition takes writes again within 15 s.** That is the pass/fail bound.
+- **A hang: about 17 s.** A silent host's sockets stay open, so the owner first waits to be
+  sure the copy is gone, not just slow. 25 s is the hard ceiling.
+- A loaded machine runs longer. One test run at load 47 took 13.7 s for a copy.
+- `rdb_node --failover` prints these figures once at open, as `rdb_node failover bound_ms=...`.
+
+**What your app sees during the stop.**
+
+- A write that gets no answer in time is `UNKNOWN_OUTCOME` ("no answer in ..."). It was sent.
+  It may still land. Ask `db.status` with the same request id, or `db.resend` it.
+- `UNAVAILABLE` with "nothing was sent" is different. It comes only when the write could not
+  be compiled in time, or the owner had no link at all. Nothing was written. Send it again as
+  a new write.
+- A read that gets no answer is `UNAVAILABLE`. A read changes nothing, so just retry.
+- Keep retrying with a short pause. After a timeout, the `Db` reads the partition's owner
+  again, so the next try goes to the new owner. You do not need to reopen anything.
+- `db.wait_ready` and `db.readiness` follow the new owner the same way.
+
+**A node that was lost and comes back.**
+
+- **After a crash,** restart it on its own folder. It rejoins as a copy by itself. It does not
+  get its partitions back. It can be made owner again by a later failover.
+- **After a hang,** the node may wake up with its grant frozen. It then runs but can never
+  lead. Restart it. `rdb_node` does this for you: it exits 75 for its supervisor (section 4,
+  "Supervising a node process"). An embedded `Db` polls `db.restart_wanted()` about once a
+  second. On `Some(RestartReason::ReplaceStopped)`, restart the `Db` and its `Net` in-process,
+  as in "Embedded restart" above. Run one `Db` per node.
+
+**Limits in this release.**
+
+- **Two copies of one partition down: that partition stops taking writes.** The one copy
+  left may be missing acknowledged writes, so it is never promoted. Other partitions fail
+  over as usual. When writes return depends on which copy comes back:
+  - The owner is alive and a copy returns: the owner adds it back, and writes return.
+  - The owner is dead and the owner returns: writes stay stopped until its other copy is
+    back too (#169, being fixed).
+  - The owner is dead and a copy that is not the owner returns: it is not added back. The
+    partition stays stopped until the owner returns (#177).
+- **#169:** the second case above.
+- **#177:** the third case above.
+- **A hung node that wakes up stays frozen until it is restarted** (#168). See above.
+- If a host hangs while it is the last reachable copy of a partition, and the partition's
+  other copies are also down, restarting that host does not bring the partition back; it
+  returns when one of its other copies returns. See #168 and #172.
+- **Tested on one machine.** See "Docker run" below.
+
+**Docker run (#176).** `scripts/docker-multihost.sh d1` runs five data nodes and three rEtcd
+voters, each in its own container, on one host. It kills one data node at a time, back to
+back, and restarts each one.
+
+- **Run 2, without #171: failed.** The first kill passed: owner 6.7 s, copy 10.9 s, load 10.8.
+  The next two did not. The node restarted after the first kill kept a frozen grant, so its
+  copies did not count. Later failovers then stopped as `lone_survivor`. #171 fixes this.
+- **Re-run with #171: passed.** All four back-to-back kills passed, and so did two voter
+  restarts. Writes came back within 7.3 s for an owner's partitions and 10.6 s for a copy's.
+  Each restarted node's frozen grant was cleared about 1 s after it restarted. Load was 2 to 3.
+
+### Adding and removing a node
+
+Call `admin::add_member` to add a data node and `admin::remove_member` to remove one. Each
+checks membership first, then writes. `admin::add_node` and `admin::remove_node` write
+without the check; do not call them from an app.
+
+**Adding a node: add, restart the apps, rebalance.** In that order:
+
+1. Add the node's record with `admin::add_member` (`rdb_dev`: `admin add-node --addr A
+   --machine M`). It answers with the id it gave.
+2. Start the node with that id, its certificate, and `--peers` naming nodes 1 to K with no
+   gap, removed ids included (below).
+3. Restart every app-only process (`rdb-server`, `rdb_dev`, or any process that runs no copy)
+   with the new node in its `--nodes`. Such a process links only to the nodes it was started
+   with, so until it restarts it cannot reach a partition the new node comes to own. A node's
+   own embedded `Db` needs no restart: it admits the new node by itself.
+4. Run `admin::rebalance` (`rdb_dev`: `admin rebalance`) to give the new node its copies.
+
+`scripts/docker-multihost.sh` does steps 1 and 2 in `add` and step 4 in `rebalance`; its
+sessions name the new node in `--nodes` from then on.
+
+**What a remove does.** Removing node N marks its record removed. It is never deleted.
+Every running node drops N from its members. `route` still knows N's app address.
+
+**Ids are never reused.** The next node added gets an id above every id ever used, removed
+ones included. A database has 8 ids for its whole life. Replacing a host means adding a new
+node and removing the old one, and it uses an id.
+
+**A removed node cannot come back.** Opening the database as a removed node is refused:
+"node N was removed; ids are never reused". Start a new node instead.
+
+**A removed node's own `Db` stops for good.** Once its node is removed, every `Db` call is
+refused `INVALID_ARGUMENT`, with nothing sent: "node N was removed; ids are never reused:
+this Db serves nothing again, and nothing was sent". Its host stops at the first call after
+the removal, so poll `Db::removed()` or handle the refusal. The node logs
+`members_own_node_removed`.
+
+**How `rdb_node` exits.** `rdb_node` exits 0 when its node is removed while it runs, and asks
+for no restart. It exits 2 when it is started as a node that is already removed. Under a
+supervisor that restarts on failure, a removed node therefore exits 2 on each restart until
+the supervisor gives up; with Docker's `--restart on-failure:3`, it is restarted 3 times and
+then stays down.
+
+**A removed id in `--peers` is skipped.** It is logged `start_peer_removed_skipped`, and
+nothing dials it. It must still be listed: `--node` and `--peers` together must name nodes
+1 to K with no gap, removed ids included, up to the highest id you name or `--node`. Ids above
+that may be left out, live or removed, so a node started before a higher id was added can
+restart with the `--peers` it had.
+
+**One change at a time, and every node must answer.** Before it writes anything, the check
+asks every live node for a fresh status, within the time you pass (`within`). Each must
+answer and must have seen the latest membership change. If one does not, the change is
+refused and names it. If that node is dead, name it in `unreachable_ok`. Upgrade that node
+before you restart it: an older build cannot read the removed record and refuses to open.
+The node you remove is asked too, so a stopped node can be removed only if you name it in
+`unreachable_ok`.
+
+**A remove is refused** when node N is already removed, is not a live member, would leave
+fewer than 3 distinct machines, or still owns or holds a copy of a partition: "node N is still
+pinned by partitions [...]: run admin drain N first, or, if node N is down, wait until its
+copies are dropped (about Timeouts::unreachable_drop_after, or failover's promote) and run
+this again".
+
+**A late pin heals by itself.** A re-plan built before the remove and committed after it can
+still name the removed node; the remove logs `remove_node_still_pinned`. Nothing is needed
+from you, and running the remove again is refused because the node is already removed. Within
+about 10 to 16 s the owner drops the removed node from those partitions. Writes to them may
+pause until then, inside the 15 s lost-host bound.
+
+**Getting back to 3 copies: `admin::rebalance`.** After a host is lost, failover keeps each
+partition writable on the copies left, but nothing adds a copy on another node by itself. (A
+restarted node still rejoins by itself.) Run `admin::rebalance(db, rt, store, &opts)`. It
+first refills every partition below 3 copies onto a node that holds none of its copies, on a
+machine none of them uses. Then it moves copies until no node holds more than one copy more
+than another. A refill adds a copy; it never removes one, and the owner stays.
+
+**Draining before a remove: `admin::drain`.** `admin::drain(db, rt, store, node)` moves every
+copy off the node, promotes another owner for each partition it owned, and ends with a
+rebalance, which refills to 3 copies. Then `admin::remove_member` can take the node out.
+
+- **Drain works for a node whose `Db` runs in your process** (tested by M11, both rows
+  `s80s4_drain_then_remove_keeps_three_copies_and_every_partition_writable_*`).
+- **Drain does not work yet for a node run as `rdb_node` (#226).** The drain's freeze is not
+  lifted, so about 5 s after it the node exits 75 (restart wanted, reason
+  `replace_stopped`):
+  - With no supervisor, the node stays down, and the remove refuses it as down.
+  - With a supervisor, the node restarts and is re-added in the middle of the drain, and the
+    drain fails.
+- **To remove a node run as `rdb_node`, do not drain it.** Stop it, then remove it as a dead
+  host, below: `admin::remove_member` with it in `unreachable_ok` (in `rdb_dev`,
+  `admin remove-node N --unreachable-ok N`), then `admin::rebalance`. Its copies drop and
+  refill as for a killed host (row 2,
+  `s80s4_a_killed_node_is_removed_and_its_partitions_refill_to_three`). The cost: each
+  partition it owned pauses writes for one failover, within the 15 s lost-host bound.
+
+**Removing a host that died.** Drain is for a node that still runs: it needs the node to
+answer. For a dead host:
+
+1. Wait for failover. It moves ownership off the dead node, and the drop clock takes the dead
+   node's copies out, within about 10 to 16 s. Until then the remove is refused with "...
+   if node N is down, wait until its copies are dropped ... and run this again".
+2. Call `admin::remove_member` with the dead node named in `unreachable_ok`.
+3. Call `admin::rebalance`. It refills each partition the dead node held back to 3 copies.
+
+Upgrade the dead node before you ever restart it. As a removed node it will not start anyway
+(`rdb_node` exits 2).
+
+**Reading the report.** `RebalanceReport::refilled` and `moved` list what was done.
+`residuals` lists what is still not met, in plain words:
+
+- `no_refill_target: ...: the budget ran out; run the rebalance again`: `max_moves` was
+  reached. Run it again.
+- `no_refill_target: ...: no ok node without a copy sits on an unused machine`: add a node on
+  a new machine, then run it again.
+- `no_refill_target: ...: node N is held as left out by partition P's owner ...; a restart of
+  node N re-adds it`: **restart node N**, then run the rebalance again. This is the only case
+  that needs a restart (#207).
+- `no_live_handoff: ...`: a primary move that rebalance never runs; ownership stays where it
+  is.
+- `copy_not_run: ...`: a copy move the plan made but this run did not make, because the move
+  budget ran out or it waits on a primary handoff listed above. Run the rebalance again; one
+  that waits on a handoff stays until the owner moves by failover or drain.
+
+**Upgrade the whole cluster first, apps included.** This is the same one-way, whole-cluster
+upgrade as in "Known limits in this release" ("This build's upgrade is one-way ..."). The S4
+protocol bump is one more reason for it.
 
 ### Fencing your own side effects
 
@@ -1560,6 +1760,24 @@ floor), so the table above no longer limits it.
 - **A cap below 3 is refused at open.** The floor and the newest answer would fill it.
 - `ack_floor: false` keeps every answer for the retention, as before.
 
+### How much history a partition keeps
+
+Each copy keeps the history it applied, so a copy that was down can catch up record by record.
+A duty trims it about once a second. Two `DbConfig` options set how much is kept:
+
+- `history_keep`: how long each copy keeps history, at least. Default 30 min (`None`). A copy
+  down for longer may be rebuilt from a snapshot instead.
+- `history_budget_bytes`: the most history each copy keeps. Default 20 GiB (`None`). It is a
+  hard cap: it trims past a copy that has not acknowledged, and past a snapshot transfer, which
+  then starts again (`history_budget_overran_pin`).
+
+A copy keeps more than `history_keep` while something still needs it: a copy that has not
+acknowledged, a snapshot transfer, a recovery, or an answered inventory (at most 10 minutes).
+After a failover the new primary also trims nothing past its copies until each has
+acknowledged, or `max(history_keep, 10 minutes)` has passed. Before a partition's first trim, a
+copy that never acks holds history until the history budget (`history_budget_bytes`, default
+20 GiB) is reached; after that, a grace that expires releases it.
+
 ### When writes pause
 
 Writes can pause without any error in your code. Most pauses end by themselves, and none
@@ -1597,7 +1815,7 @@ first send refused with it true goes again as a new write, and anything else as 
 | `UNAVAILABLE`, "went out of reach ...; this call writes nothing" | It stopped before the write was sent, or under a read or status look (`no_mutation` true). | Once it is back, as a new write. |
 | `UNAVAILABLE`, "is not reachable ... nothing was sent" | No link to the owner. A read is refused this way after 1 s (`Timeouts::read`). | After a few seconds. |
 | `UNAVAILABLE`, "generation N of partition P on node 1 is not yet marked activated in the open counter; nothing was sent" | The owner moved to a new generation and has not yet heard that rEtcd records it. It sends no write until then. `no_mutation` is true on a first send. Seen after a copy is killed or started. | After a few seconds. It clears by itself. |
-| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. In this release only `rdb_dev admin trim-history`, a debug-build dev tool, trims history. | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
+| `RECOVERY_READ_ONLY`, "copy N on node M is being rebuilt from a snapshot: K entries (B MiB) sent in T s; writes resume when it is caught up" | Read-only while a copy is rebuilt. The cause comes in three steps. First, the history was trimmed. Second, a copy was down for longer than the trimmed history covers, so it cannot catch up record by record. Third, the owner died, and the one copy left cannot take writes alone. That copy owns the partition read-only and sends the other copy a snapshot. `retry` is `RetryAfterRecovery`, `no_mutation` is true, and `retry_after` is 5 s. Reads keep working. History is trimmed by each copy's retention duty ("How much history a partition keeps"). | Every 5 s (`retry_after`), as a new write. **The 5 s is a poll hint, not an estimate:** it is the soonest to ask again, not when the rebuild ends. The numbers in the message show progress. Once the copy has caught up the message says so ("copy N on node M is caught up; writes resume when the owner re-plans with it"), and writes return when the owner's next re-plan counts it, within about 3 s. |
 
 `db.node_status()` answers for partition 1. `db.node_status_in(partition)` is the same answer for
 any partition, in node order, with a node that does not answer left out. Use it to read a
@@ -1681,14 +1899,14 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (13 at this commit:
-  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list, 13 #177's
-  possible-loss ack, status and restored holdings), whether or not this setting is on. A
-  build before these guards speaks 9, even one that has this setting, and a build at 10 or 11 lacks
-  the snapshot wire or the delete and list. A build at another version and this one refuse each other when they
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (14 at this commit:
+  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list, 13
+  #244's membership revision and refill call, and 14 #238's possible-loss ack, status and restored holdings), whether or not this setting is on. A
+  build before these guards speaks 9, even one that has this setting, and a build at 10, 11 or 12
+  lacks the snapshot wire, the delete and list, or S4's fields. A build at another version and this one refuse each other when they
   connect, each logging `net_handshake_refused` with both versions. So an older node is never
   added back live, and it cannot link at all. The same holds for an app process with no copy
-  (`--nodes`): an app at an older version is refused by nodes at 13. To upgrade: stop every
+  (`--nodes`): an app at an older version is refused by nodes at 14. To upgrade: stop every
   node and every app process that links to them, upgrade them all, start the nodes, then the
   apps. A rolling upgrade, with processes at different versions, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy
@@ -1884,10 +2102,12 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   `scripts/docker-multihost.sh`'s Docker proof (#80 S2), each container on its own IP, all on
   one physical host. It has not been run on separate machines. A machine
   label is the operator's word: two labels on one box with two addresses are not caught.
-  Copies are uneven by up to 3 per node when K does not divide P. Still missing: adding or
-  removing a node. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node process started
-  on a folder of a database that was neither formed nor declared is still refused with
-  "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
+  After `admin::rebalance`, copy skew is at most 1. Before a rebalance, a formed ring can be
+  uneven by up to 3 copies per node on 6 or more nodes, and by 2 on 5. A node can be added and
+  removed (section 4, "Adding and removing a node"). Ids are never reused, so a database has
+  8 node ids for its whole life. TLS to rEtcd is in (section 3, "TLS to rEtcd"). A node
+  process started on a folder of a database that was neither formed nor declared is still
+  refused with "database not formed: ... Run lr up to form it". A whole-database open (`--form`, `lr up`)
   of a declared database is refused: its node processes form it.
 - **A copy missed while the database is first formed never joins.** This happens when a node's
   report misses the first discovery window, for example when the host stalls during `lr up`.
@@ -1938,6 +2158,23 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - `Trimmed` (issue #61): the history needed to adopt the tail is trimmed, so it cannot come
     back. Giving it up still needs `--give-up-live-copy`, and forget-tail's refusal names the
     whole command.
+- **A copy whose snapshot the history budget keeps cutting short needs an operator** (issue
+  #61). Under heavy writes and a small `history_budget_bytes`, the budget can trim past a
+  snapshot transfer before it finishes. The source restarts it, and after 3 in a row it stops
+  and sets `needs_operator` in `Db::node_status()` on that node: "copy N cannot be rebuilt from
+  node M: the history budget overran its snapshot transfer 3 times in a row; ...". It is
+  logged `history_budget_gave_up` (warn). To change the history budget, reopen the `Db` with a
+  larger `history_budget_bytes`: the budget is fixed when the node starts. Reducing writes alone
+  does not clear an existing give-up. A newer generation clears it without restart and logs
+  `history_budget_give_up_cleared`, so a later snapshot request is offered again. A caught-up
+  release also clears it, silently.
+  The budget is a hard cap except for holds: staging, installing, recovering, landing and an
+  answered inventory (up to 10 minutes). A degraded rebuild also keeps History from its cutoff
+  while F1 stays `Rebuilding`, for up to max(`history_keep`, inventory pin), 30 min at the
+  defaults. Each round held that way logs `history_trim_held_rebuild{cutoff, floor_was}`
+  (info); past the limit the cap applies again, logged once `history_trim_rebuild_hold_expired`
+  (warn). The activation needs the record at the cutoff, so a trim past it makes the primary
+  refuse its own activation.
 - **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
   `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
   set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,
@@ -1956,13 +2193,14 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   - If `degraded` still names the copy after the command was accepted, run the same command
     again. An accepted forget-tail's re-plan can still commit read-only, for example with too few
     copies.
-- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** When a copy rejoins,
-  the owner can re-plan while a put is in flight. If the re-plan keeps the put, the answer is
-  `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under (issue
-  #111). If the re-plan cannot tell, or the put had already published and was waiting on its
-  last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied": ask
-  `db.status`, send it again with `db.resend`, or read the key back. Never send it again as a
-  new write.
+- **A write can be durable and still be answered `UNKNOWN_OUTCOME`.** The owner re-plans a
+  partition when a copy rejoins, and during a move or a refill, and a put can be in flight
+  when it does. Every re-plan answers that put the same way. If the re-plan keeps the put, the
+  answer is `Ok` with `outcome` `RecoveredApplied` and the `generation` the put was sent under
+  (issue #111). If the re-plan cannot tell, or the put had already published and was waiting
+  on its last check, the answer is still `UNKNOWN_OUTCOME`. Treat that as "may have applied":
+  ask `db.status`, send it again with `db.resend`, or read the key back. Never send it again
+  as a new write.
 - **Damaged data on one node is reported, not repaired.** If one node's stored data is corrupt,
   rDB does not move ownership to a clean copy. Reads and writes that reach it fail with an
   `Unavailable` error whose message says `storage read fault Corrupt`. You never get a wrong or
@@ -2008,11 +2246,13 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   reads layout 4 but plans nodes 1 to 3 at the open, so it leaves the moved copy out.
 - **This build's upgrade is one-way, and the whole cluster stops and restarts together**
   (issue #105). Its first recovery writes `partitions/1` at layout 6, which an older build reads
-  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (13 at this commit: 10 for
-  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148, 13 for #177), and the handshake
-  refuses any other version, from nodes and app processes alike.
+  as undecodable. Its node protocol is the version in `PROTOCOL_VERSION` (14 at this commit: 10 for
+  issues #107 and #87, 11 for issue #61's snapshot wire, 12 for #147 and #148, 13 for #244's
+  membership and refill, and 14 for #238's possible-loss ack, status and restored holdings), and the handshake refuses any other version, from nodes and app
+  processes alike, so nodes on different builds never link.
   Roll back only by restoring a backup taken before the upgrade. A partition that already held
-  such a tail at upgrade time may need `admin forget-tail` once.
+  such a tail at upgrade time may need `admin forget-tail` once. The S4 protocol bump, which
+  came with adding and removing a node, is one more reason the whole cluster upgrades together.
 - **A restarted secondary rejoins by itself,** as a standby first: writes pause briefly, then
   resume ("When writes pause" above). **Embedded only: a restarted owner stays out until the
   folder is opened again.** That is node 1 restarted inside this open (`Db::restart_node`);

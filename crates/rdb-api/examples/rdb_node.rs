@@ -4,6 +4,7 @@
 //! ```text
 //! rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
 //!          [--control-cluster CID --control-voters 1=HOST,...]
+//! rdb_node --gen-certs --cert-dir C --issue-node N
 //! rdb_node --form --dir D --control E [--control-tls T] [--log-dir L] [--partitions P]
 //! rdb_node --declare --control E [--control-tls T] --peers 1=ADDR,...,K=ADDR
 //!          [--machines N=LABEL,...] [--partitions P] [--nodes K] [--log-dir L]
@@ -31,6 +32,10 @@
 //!   presents (`retcd://CID/client/rdb`), and one certificate per rEtcd voter, for its node id,
 //!   `node-N.CID.retcd` and HOST, all signed by the same development CA (#80 S2,
 //!   ADR-rdb-0024). Production brings its own files in that layout.
+//! * `--gen-certs --issue-node N` (#80 S4) signs `node-N.pem` / `node-N.key` for a node added at
+//!   runtime with the CA already in `--cert-dir` (`ca.pem`, `ca.key`), and changes nothing else.
+//!   It refuses, writing nothing, when `ca.key` is missing or node N already has a certificate,
+//!   and takes no `--nodes`, `--apps` or control flags: those make a fresh CA.
 //! * `--control-tls T` dials rEtcd over mutual TLS with `T/ca.pem`, `T/client.pem` and
 //!   `T/client.key`, the cluster id read from the client certificate's SAN; it prints
 //!   `rdb_node control tls cluster=CID principal=P`. Without it the link is plaintext, and
@@ -97,7 +102,13 @@
 //!   1000), that answers no look, and whose grant has run out; or of a node whose grant is
 //!   frozen. At most `--failover-max-concurrent` (default 16, least 1) promotes run at once.
 //!   Off by default. Either knob without `--failover` is refused, and so is `--failover` with
-//!   `--form` or `--gen-certs`: neither runs a planner.
+//!   `--form` or `--gen-certs`: neither runs a planner. With `--failover`, after `rdb_node open`
+//!   it prints the write-outage bound once (#80 S3, `planner::write_outage_bound`):
+//!   `rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 kill_ms=13450
+//!   silent_ms=15650 silent_stated_ms=17000 silent_ceiling_ms=25000 promote_ceiling_ms=16200` at
+//!   the defaults. `bound_ms` is pass/fail for the classes in `gates` (a kill). A silent copy is
+//!   reported against `silent_stated_ms` and fails only above `silent_ceiling_ms`. The `_ms`
+//!   terms are expected outages, for a probe whose puts time out after 1 s.
 //!
 //! Stdout, one line per step, for a script to wait on:
 //! `rdb_node listening node=N addr=ADDR boot=B`, then `rdb_node open node=N`, then
@@ -117,8 +128,12 @@
 //! prints `rdb_node stopped node=N` and exits 75: its supervisor should start it again, at a new
 //! boot, and the owner re-adds it. A failed list keeps it up (`db_restart_check_unread`). The
 //! rule is `Db::restart_wanted`'s, which an embedder polls the same way.
-//! Errors go to stderr with the step that failed. Exit codes: 0 stopped or formed, 1 a start
-//! step failed, 2 bad arguments, 75 restart wanted (V10).
+//! #80 S4: in the same check, once `nodes/N` is removed (`Db::removed`) it prints
+//! `rdb_node removed node=N` (logged `rdb_node_removed`), shuts down and exits 0: its id is never
+//! used again, so it asks for no restart. A start as a removed node is refused "node N was
+//! removed; ids are never reused; nothing was started" and exits 2, a bad argument.
+//! Errors go to stderr with the step that failed. Exit codes: 0 stopped, formed or removed, 1 a
+//! start step failed, 2 bad arguments (a removed `--node` too), 75 restart wanted (V10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -189,6 +204,8 @@ struct Args {
     control_cluster: Option<config_core::ClusterId>,
     /// `--control-voters 1=HOST,...` (#80 S2): the rEtcd voters `--gen-certs` certifies.
     control_voters: Vec<(u64, String)>,
+    /// `--issue-node N` (#80 S4): `--gen-certs` signs node N with the existing CA instead.
+    issue_node: Option<u32>,
 }
 
 /// The apps this node lets move or rebuild a copy: `--admin-apps` as given, or none when the
@@ -200,6 +217,7 @@ fn admin_apps(args: &Args) -> BTreeSet<String> {
 const USAGE: &str = "usage:
   rdb_node --gen-certs --cert-dir C [--apps a,b] [--nodes K]
            [--control-cluster CID --control-voters 1=HOST,...]
+  rdb_node --gen-certs --cert-dir C --issue-node N
   rdb_node --form --dir D --control E [--control-tls T] [--log-dir L] [--partitions P]
   rdb_node --declare --control E [--control-tls T] --peers 1=ADDR,...,K=ADDR
            [--machines N=LABEL,...] [--partitions P] [--nodes K] [--log-dir L]
@@ -283,6 +301,15 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                     .collect();
             }
             "--cert-dir" => args.cert_dir = Some(value("--cert-dir")?.into()),
+            "--issue-node" => {
+                let text = value("--issue-node")?;
+                args.issue_node = Some(
+                    text.parse()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| format!("--issue-node {text:?} is not a node number"))?,
+                );
+            }
             "--control-tls" => args.control_tls = Some(value("--control-tls")?.into()),
             "--control-cluster" => {
                 let text = value("--control-cluster")?;
@@ -422,7 +449,32 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     control_certs_refusal(&args)?;
+    issue_node_refusal(&args)?;
     Ok(args)
+}
+
+/// `--issue-node` (#80 S4) is read by `--gen-certs` only, and alone: `--nodes`, `--apps` and
+/// the control flags make a fresh CA, which would sign certificates no running node trusts.
+fn issue_node_refusal(args: &Args) -> Result<(), String> {
+    if args.issue_node.is_none() {
+        return Ok(());
+    }
+    if !args.gen_certs {
+        return Err("--issue-node is read only by --gen-certs".into());
+    }
+    for (given, flag) in [
+        (args.nodes.is_some(), "--nodes"),
+        (!args.apps.is_empty(), "--apps"),
+        (args.control_cluster.is_some(), "--control-cluster"),
+    ] {
+        if given {
+            return Err(format!(
+                "--issue-node signs with the CA already in --cert-dir and takes no {flag}, \
+                 which makes a fresh CA"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `--control-cluster` and `--control-voters` (#80 S2) are read by `--gen-certs` only, and
@@ -551,6 +603,51 @@ fn watch_clock_step(file: PathBuf, links: Arc<Links>) {
     });
 }
 
+/// A node process's `DbConfig::timeouts`: `--unreachable-drop-after-ms` and `--live-readd` over
+/// the defaults.
+fn timeouts(args: &Args) -> Timeouts {
+    Timeouts {
+        unreachable_drop_after: args.unreachable_drop_after_ms.map_or(
+            Timeouts::default().unreachable_drop_after,
+            Duration::from_millis,
+        ),
+        live_readd: args.live_readd,
+        ..Timeouts::default()
+    }
+}
+
+/// #80 S3: with `--failover`, the line that states this node's write-outage bound, so a script
+/// reads it and never recomputes it: `rdb_node failover bound_ms=B gates=C,.. owner_ms=O
+/// kill_ms=K silent_ms=S promote_ceiling_ms=P`. `bound_ms` and `gates` are
+/// `OutageBound::acceptance`; the rest are `planner::write_outage_bound`'s terms on the spec
+/// budgets a node process opens on, this process's timeouts and planner, and the put timeout
+/// `rdb_dev probe-all` runs with. `None` without `--failover`.
+fn failover_bound_line(args: &Args) -> Option<String> {
+    let failover = failover(args)?;
+    let bound = rdb_api::write_outage_bound(
+        &rdb_core::contracts::event::Budgets::SPEC_DEFAULTS,
+        &timeouts(args),
+        &failover,
+        rdb_api::planner::PROBE_PUT_TIMEOUT,
+    );
+    let ms = |d: Duration| d.as_millis();
+    let (limit, gates) = bound.acceptance();
+    let (stated, ceiling) = bound.silent();
+    let gates: Vec<&str> = gates.iter().map(|class| class.word()).collect();
+    Some(format!(
+        "rdb_node failover bound_ms={} gates={} owner_ms={} kill_ms={} silent_ms={} \
+         silent_stated_ms={} silent_ceiling_ms={} promote_ceiling_ms={}",
+        ms(limit),
+        gates.join(","),
+        ms(bound.owner),
+        ms(bound.secondary_kill),
+        ms(bound.secondary_silent),
+        ms(stated),
+        ms(ceiling),
+        ms(bound.ceilings.promote_within),
+    ))
+}
+
 /// `DbConfig::failover` from `--failover` and its knobs; `None` without `--failover`.
 fn failover(args: &Args) -> Option<rdb_api::Failover> {
     let default = rdb_api::Failover::default();
@@ -638,7 +735,11 @@ fn run(
             } else {
                 serve(&args, &rt)
             };
-            exit_code(result)
+            if let Err(message) = &result {
+                tracing::error!(%message, "rdb_node_failed");
+                eprintln!("rdb_node: {message}");
+            }
+            ExitCode::from(exit_code(&result))
         }
         Err(e) => {
             eprintln!("rdb_node: runtime: {e}");
@@ -649,17 +750,13 @@ fn run(
     code
 }
 
-/// The exit code for how a run ended: 0 at the stop file, [`RESTART_EXIT`] when it asks its
-/// supervisor for a restart (V10, #81), 1 on a failure, which is logged and printed.
-fn exit_code(result: Result<Served, String>) -> ExitCode {
+/// The exit code of a node process whose serve, form or declare ended as `result`.
+fn exit_code(result: &Result<Served, String>) -> u8 {
     match result {
-        Ok(Served::Stopped) => ExitCode::SUCCESS,
-        Ok(Served::Restart(_)) => ExitCode::from(RESTART_EXIT),
-        Err(message) => {
-            tracing::error!(%message, "rdb_node_failed");
-            eprintln!("rdb_node: {message}");
-            ExitCode::from(1)
-        }
+        Ok(Served::Stopped | Served::Removed) => 0,
+        Ok(Served::Restart(_)) => RESTART_EXIT,
+        Ok(Served::RemovedId) => 2,
+        Err(_) => 1,
     }
 }
 
@@ -668,6 +765,18 @@ fn gen_certs(args: &Args) -> ExitCode {
         eprintln!("rdb_node: --gen-certs needs --cert-dir");
         return ExitCode::from(2);
     };
+    if let Some(n) = args.issue_node {
+        return match certs::issue_node(dir, NodeId(n)) {
+            Ok(()) => {
+                println!("rdb_node certs dir={} issued=node-{n}", dir.display());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("rdb_node: --gen-certs --issue-node {n}: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let labels: Vec<Label> = (1..=args.nodes.unwrap_or(3))
         .map(|n| Label::Node(NodeId(n)))
         .chain(args.apps.iter().cloned().map(Label::App))
@@ -756,6 +865,8 @@ fn form(args: &Args, rt: &tokio::runtime::Runtime) -> Result<(), String> {
         timeouts: Timeouts::default(),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: ALL_NODES.to_vec(),
         links: None,
         client: DEFAULT_CLIENT,
@@ -828,14 +939,16 @@ fn declare_on(
 /// The node-start check (#80 S1b rulings 2 and 4, ADR-rdb-0023 Decision 5): on a declared
 /// database, `--listen` and every `--peers` entry must be what the `nodes/` records say, and an
 /// S1a store (no records) is refused. Run before this process writes its boot or binds, so a
-/// refused start leaves nothing behind. An undeclared database passes.
+/// refused start leaves nothing behind. An undeclared database passes. #80 S4 (S-4): a
+/// `--peers` entry whose record is removed is skipped, not refused; the answer is the removed
+/// nodes, which this process does not dial.
 fn start_check_on(
     args: &Args,
     node: NodeId,
     listen: &str,
     store: &dyn ConfigStore,
     rt: &tokio::runtime::Runtime,
-) -> Result<(), String> {
+) -> Result<BTreeSet<NodeId>, String> {
     let formation = rt
         .block_on(rdb_api::admin::read_formation(store))
         .map_err(|e| format!("start check: {e}"))?;
@@ -844,6 +957,12 @@ fn start_check_on(
             .block_on(rdb_api::admin::read_nodes(store))
             .map_err(|e| format!("start check: {e}"))?,
         None => BTreeMap::new(),
+    };
+    let removed = match &formation {
+        Some(_) => rt
+            .block_on(rdb_api::admin::read_removed_nodes(store))
+            .map_err(|e| format!("start check: {e}"))?,
+        None => BTreeSet::new(),
     };
     // #80 S2 ruling 1 (ADR-rdb-0024): before the boot is written or anything is bound, as the
     // open would refuse it after.
@@ -857,14 +976,46 @@ fn start_check_on(
         .map(|why| format!("{why}; nothing was started"))
     });
     match plaintext.or_else(|| {
-        rdb_api::admin::node_start_refusal(node, listen, &args.peers, formation.as_ref(), &records)
+        rdb_api::admin::node_start_refusal(
+            node,
+            listen,
+            &args.peers,
+            formation.as_ref(),
+            &records,
+            &removed,
+        )
     }) {
         Some(refused) => {
             tracing::warn!(node = node.0, %refused, "rdb_node_start_refused");
             Err(format!("start check: {refused}"))
         }
-        None => Ok(()),
+        None => Ok(removed),
     }
+}
+
+/// #80 S4 (M8): the refusal of a start as a removed node, "node N was removed; ids are never
+/// reused; nothing was started", or `None` when `node` is live or the database is undeclared.
+/// Run first, before [`start_check_on`]: a removed id given as `--node` is a bad argument, so
+/// the serve ends [`Served::RemovedId`], exit 2.
+fn removed_start_check(
+    node: NodeId,
+    store: &dyn ConfigStore,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Option<String>, String> {
+    let declared = rt
+        .block_on(rdb_api::admin::read_formation(store))
+        .map_err(|e| format!("start check: {e}"))?
+        .is_some();
+    if !declared {
+        return Ok(None);
+    }
+    let records = rt
+        .block_on(rdb_api::admin::read_nodes(store))
+        .map_err(|e| format!("start check: {e}"))?;
+    Ok(rt
+        .block_on(rdb_api::admin::own_removed_refusal(store, node, &records))
+        .map_err(|e| format!("start check: {e}"))?
+        .map(|why| format!("{why}; nothing was started")))
 }
 
 /// How often [`watch_ownership`] reads each partition's ownership.
@@ -1048,7 +1199,35 @@ fn serve(args: &Args, rt: &tokio::runtime::Runtime) -> Result<Served, String> {
         let _entered = rt.enter();
         control(args)?
     };
+    #[cfg(unix)]
+    listen_for_term(rt, &TERMINATED).map_err(|e| format!("cannot listen for SIGTERM: {e}"))?;
     serve_on(args, rt, store)
+}
+
+/// Set by SIGTERM or SIGINT: the serve loop stops as it does for `--stop-file`, so a
+/// supervisor's stop (`docker stop`, systemd) shuts the node down cleanly. Only [`serve`]
+/// installs it, so a row's serve in the test binary is never stopped by another's signal.
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+/// Set `flag` when this process gets SIGTERM or SIGINT, logging `rdb_node_sigterm`.
+#[cfg(unix)]
+fn listen_for_term(rt: &tokio::runtime::Runtime, flag: &'static AtomicBool) -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let _entered = rt.enter();
+    for (kind, name) in [
+        (SignalKind::terminate(), "TERM"),
+        (SignalKind::interrupt(), "INT"),
+    ] {
+        let mut signals = signal(kind)?;
+        let span = tracing::Span::current();
+        rt.spawn(async move {
+            if signals.recv().await.is_some() {
+                span.in_scope(|| tracing::warn!(signal = name, "rdb_node_sigterm"));
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+    Ok(())
 }
 
 /// [`serve`] on `store`, so a row can run the node process's start on its own store.
@@ -1082,8 +1261,21 @@ fn serve_on_ready(
     if let Some(path) = &args.faults {
         faults.watch_file(path.clone());
     }
-    // #80 S1b: before the boot is written or anything is bound.
-    start_check_on(args, node, &listen, &*store, rt)?;
+    // #80 S1b: before the boot is written or anything is bound. #80 S4: a removed id first.
+    if let Some(refused) = removed_start_check(node, &*store, rt)? {
+        tracing::warn!(node = node.0, %refused, "rdb_node_start_refused");
+        eprintln!("rdb_node: start check: {refused}");
+        return Ok(Served::RemovedId);
+    }
+    let removed = start_check_on(args, node, &listen, &*store, rt)?;
+    // S-4: a removed peer is neither dialled nor a member, nor given to the open.
+    let peers: BTreeSet<NodeId> = peers.difference(&removed).copied().collect();
+    let live_peers: BTreeMap<NodeId, String> = args
+        .peers
+        .iter()
+        .filter(|(peer, _)| !removed.contains(peer))
+        .map(|(peer, addr)| (*peer, addr.clone()))
+        .collect();
     if let Some(bound) = &bound {
         let at = bound
             .local_addr()
@@ -1114,7 +1306,7 @@ fn serve_on_ready(
             boot,
             tls,
             peers,
-            dial: NetConfig::dial_lower(node, &args.peers),
+            dial: NetConfig::dial_lower(node, &live_peers),
             protocol_version: args.protocol_version.unwrap_or(PROTOCOL_VERSION),
             faults,
             admin_apps: admin_apps(args),
@@ -1134,16 +1326,11 @@ fn serve_on_ready(
         ack_floor: true,
         dir: dir.clone(),
         hold: Vec::new(),
-        timeouts: Timeouts {
-            unreachable_drop_after: args.unreachable_drop_after_ms.map_or(
-                Timeouts::default().unreachable_drop_after,
-                Duration::from_millis,
-            ),
-            live_readd: args.live_readd,
-            ..Timeouts::default()
-        },
+        timeouts: timeouts(args),
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: vec![node],
         links: Some(Arc::clone(&links)),
         client: DEFAULT_CLIENT,
@@ -1153,7 +1340,7 @@ fn serve_on_ready(
         // #80 S1b ruling 2: checked against the records by the open too, as an embedded node is.
         addresses: Some(rdb_api::NodeAddresses {
             listen: listen.clone(),
-            peers: args.peers.clone(),
+            peers: live_peers,
             app: args.app_addr.clone(),
         }),
     };
@@ -1161,6 +1348,10 @@ fn serve_on_ready(
         .block_on(Db::open(config, store, rt.handle().clone()))
         .map_err(|e| format!("open {} as node {}: {e}", dir.display(), node.0))?;
     println!("rdb_node open node={}", node.0);
+    if let Some(line) = failover_bound_line(args) {
+        tracing::info!(node = node.0, %line, "rdb_node_failover_bound");
+        println!("{line}");
+    }
     let within = Duration::from_secs(args.ready_secs.unwrap_or(60));
     let waited = std::time::Instant::now();
     // A missed deadline is a line, not a stop (tester-s2 `lr up` race, A-R271): only a time-out
@@ -1170,7 +1361,10 @@ fn serve_on_ready(
         on_ready(node);
     }
     let mut retrying = report_ready(node, first);
-    let stopped = || args.stop_file.as_ref().is_some_and(|stop| stop.exists());
+    let stopped = || {
+        TERMINATED.load(Ordering::SeqCst)
+            || args.stop_file.as_ref().is_some_and(|stop| stop.exists())
+    };
     let done = AtomicBool::new(false);
     // Each watcher logs in the span this serve runs in, as the node's own lines do, so a row's
     // node logs land in that row's file, not untagged.
@@ -1185,6 +1379,13 @@ fn serve_on_ready(
             // read timeout.
             if checked.elapsed() >= RESTART_CHECK_EVERY {
                 checked = std::time::Instant::now();
+                // #80 S4 (S-5): a removed node is done for good, so no restart is asked for.
+                if db.removed() {
+                    tracing::warn!(node = node.0, "rdb_node_removed");
+                    println!("rdb_node removed node={}", node.0);
+                    served = Served::Removed;
+                    break;
+                }
                 if let Some(reason) = db.restart_wanted() {
                     tracing::warn!(node = node.0, %reason, "rdb_node_restart_wanted");
                     println!("rdb_node restart-wanted node={} reason={reason}", node.0);
@@ -1229,6 +1430,12 @@ fn serve_on_ready(
 enum Served {
     /// `--stop-file` appeared: exit 0.
     Stopped,
+    /// #80 S4 (S-5): this node's `nodes/` record was removed (`Db::removed`), so it serves
+    /// nothing again and its id is never reused: exit 0, and a supervisor should not start it.
+    Removed,
+    /// #80 S4 (M8): `--node` names a removed node, so nothing was started: exit 2, a bad
+    /// argument ([`removed_start_check`]).
+    RemovedId,
     /// V10 (#81): this boot can serve nothing again, so it asks its supervisor for a restart,
     /// [`RESTART_EXIT`]. The reason `Db::restart_wanted` gave.
     Restart(RestartReason),
@@ -1280,6 +1487,35 @@ mod tests {
 
     fn parsed(argv: &[&str]) -> Result<super::Args, String> {
         parse(argv.iter().map(|a| (*a).to_owned()))
+    }
+
+    /// #80 S3 T1: `--failover` states its write-outage bound in one line, the values of
+    /// `planner::write_outage_bound` at the spec budgets and the probe's 1 s put, so a script
+    /// reads the bound and never recomputes it. A node's own `--unreachable-drop-after-ms` moves
+    /// the kill-copy term and nothing else; without `--failover` there is no line. Unit.
+    /// Cut: `failover_bound_line` passes `Timeouts::default()` instead of the node's own; the
+    /// 5 s drop clock still prints `kill_ms=13450`, red, observed 2026-11-20.
+    #[test]
+    fn s80s3_failover_prints_its_outage_bound_and_without_it_nothing() {
+        let line = |argv: &[&str]| super::failover_bound_line(&parsed(argv).expect("parses"));
+        let node = ["--node", "1", "--failover"];
+        assert_eq!(
+            line(&node).as_deref(),
+            Some(
+                "rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 \
+                 kill_ms=13450 silent_ms=15650 \
+                 silent_stated_ms=17000 silent_ceiling_ms=25000 promote_ceiling_ms=16200"
+            )
+        );
+        assert_eq!(
+            line(&[&node[..], &["--unreachable-drop-after-ms", "5000"]].concat()).as_deref(),
+            Some(
+                "rdb_node failover bound_ms=15000 gates=owner,secondary_kill owner_ms=12050 \
+                 kill_ms=8450 silent_ms=15650 \
+                 silent_stated_ms=17000 silent_ceiling_ms=25000 promote_ceiling_ms=16200"
+            )
+        );
+        assert_eq!(line(&["--node", "1"]), None);
     }
 
     /// #80 S1a: `--declare` runs no planner either, so `--failover` with it is refused; plain
@@ -2546,6 +2782,78 @@ mod tests {
             .expect("over TLS node 1's start check passes");
     }
 
+    /// #80 S4 M8 start half: a database is declared with nodes 1 to 3, and `nodes/3` is then
+    /// written removed (layout 3). A start as node 3 is refused "node 3 was removed; ids are
+    /// never reused; nothing was started", writes no boot, and its exit code is 2; node 1 is
+    /// not refused. Unit (one store, no node process).
+    /// Cut: `admin::own_removed_refusal` always answers `None`: node 3's check answers
+    /// "Ok(None)", red, observed 2026-11-21 at load 17-22.
+    #[config_log::retcd_test]
+    fn s80s4_a_removed_nodes_start_check_is_refused_with_the_reused_id_text() {
+        const LOCAL: &str = "1=127.0.0.1:7100,2=127.0.0.2:7100,3=127.0.0.3:7100";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let args = parsed(&["--declare", "--peers", LOCAL]).expect("parses");
+        declare_on(&args, &store, &rt).expect("nodes 1 to 3 are declared");
+        let three = rt
+            .block_on(rdb_api::admin::read_nodes(&*store))
+            .expect("the records list")[&rdb_api::NodeId(3)]
+            .clone();
+        let written = rt
+            .block_on(store.put(config_core::PutRequest {
+                key: bytes::Bytes::from(
+                    rdb_core::contracts::control::ControlKey::Node(rdb_api::NodeId(3)).encode(),
+                ),
+                value: three.encode_removed(None),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+            .expect("nodes/3 is written removed");
+        assert_eq!(written.outcome, config_core::MutationOutcome::Applied);
+
+        let refused = super::removed_start_check(rdb_api::NodeId(3), &*store, &rt);
+        assert!(
+            matches!(&refused, Ok(Some(text)) if text == "node 3 was removed; ids are never \
+                reused; nothing was started"),
+            "{refused:?}"
+        );
+        let path = |p: &std::path::Path| p.display().to_string();
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("node-3");
+        let args = parsed(&[
+            "--node",
+            "3",
+            "--dir",
+            &path(&dir),
+            "--listen",
+            "127.0.0.3:7100",
+            "--peers",
+            LOCAL,
+            "--control",
+            "http://127.0.0.1:1",
+            "--cert-dir",
+            &path(&root.path().join("certs")),
+        ])
+        .expect("parses");
+        let served = super::serve_on(&args, &rt, Arc::clone(&store));
+        assert!(matches!(served, Ok(super::Served::RemovedId)), "{served:?}");
+        assert_eq!(
+            super::exit_code(&served),
+            2,
+            "a removed --node is a bad argument"
+        );
+        assert!(!dir.exists(), "no boot was written in {}", dir.display());
+
+        assert_eq!(
+            super::removed_start_check(rdb_api::NodeId(1), &*store, &rt),
+            Ok(None),
+            "node 1 is live"
+        );
+    }
+
     /// #80 S2: `--control-cluster` and `--control-voters` are read by `--gen-certs` only, and
     /// together; `--control-tls` parses for every mode. Unit.
     #[test]
@@ -2635,6 +2943,114 @@ mod tests {
             assert!(control.join(format!("voter-{n}.key")).exists(), "voter {n}");
         }
         assert!(dir.join("node-5.pem").exists() && dir.join("app-admin.pem").exists());
+    }
+
+    /// #80 S4 T10 (M12's operator step): `--gen-certs --cert-dir C --issue-node 6` over a
+    /// formed `C` exits 0, prints `issued=node-6`, and writes `node-6.*` signed by C's CA, with
+    /// `ca.pem` and every other node's files unchanged. Issuing 6 again, or from a folder
+    /// without `ca.key`, exits 1 and writes nothing. `--issue-node` parses only with
+    /// `--gen-certs`, alone (no `--nodes`, `--apps` or control flags) and for a node number.
+    /// Unit. That the formed nodes trust the result over a handshake is
+    /// `net::tests::s80s4_a_node_certificate_from_another_ca_is_refused_by_the_listener`.
+    /// Cut: `gen_certs` ignores `--issue-node` and generates as before (a fresh CA, nodes 1-3):
+    /// no `node-6.pem` is written, red, observed 2026-11-20.
+    #[config_log::retcd_test]
+    fn s80s4_gen_certs_issue_node_signs_one_more_node_with_the_existing_ca() {
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        let run = |extra: &[&str], dir: &std::path::Path| {
+            let argv: Vec<String> = ["--gen-certs", "--cert-dir", &dir.display().to_string()]
+                .iter()
+                .chain(extra)
+                .map(|a| (*a).to_owned())
+                .collect();
+            super::run(argv.into_iter(), |_| Ok(None), super::serve)
+        };
+        let read = |path: std::path::PathBuf| {
+            std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        assert_eq!(
+            run(&["--nodes", "5"], &dir),
+            std::process::ExitCode::SUCCESS
+        );
+        let kept = ["ca.pem", "ca.key", "node-1.pem", "node-5.key"];
+        let before: Vec<Vec<u8>> = kept.iter().map(|f| read(dir.join(f))).collect();
+
+        assert_eq!(
+            run(&["--issue-node", "6"], &dir),
+            std::process::ExitCode::SUCCESS
+        );
+        let issued = read(dir.join("node-6.pem"));
+        assert!(dir.join("node-6.key").exists());
+        let after: Vec<Vec<u8>> = kept.iter().map(|f| read(dir.join(f))).collect();
+        assert!(before == after, "the CA and nodes 1-5 are unchanged");
+        let der = rustls_pemfile::certs(&mut &issued[..])
+            .next()
+            .expect("one certificate")
+            .expect("parses");
+        assert_eq!(
+            rdb_api::net::certs::label_from_der(der.as_ref()),
+            Some(super::Label::Node(super::NodeId(6)))
+        );
+
+        assert_eq!(
+            run(&["--issue-node", "6"], &dir),
+            std::process::ExitCode::from(1),
+            "node 6 already has a certificate"
+        );
+        assert!(
+            read(dir.join("node-6.pem")) == issued,
+            "node 6 is left alone"
+        );
+
+        let keyless = root.path().join("keyless");
+        assert_eq!(run(&[], &keyless), std::process::ExitCode::SUCCESS);
+        std::fs::remove_file(keyless.join("ca.key")).expect("remove ca.key");
+        assert_eq!(
+            run(&["--issue-node", "6"], &keyless),
+            std::process::ExitCode::from(1),
+            "no ca.key"
+        );
+        assert!(!keyless.join("node-6.pem").exists() && !keyless.join("ca.key").exists());
+
+        const CID: &str = "80808080808080808080808080808080";
+        for (argv, refused) in [
+            (&["--issue-node", "6"][..], "read only by --gen-certs"),
+            (
+                &["--gen-certs", "--issue-node", "6", "--nodes", "6"][..],
+                "takes no --nodes",
+            ),
+            (
+                &["--gen-certs", "--issue-node", "6", "--apps", "admin"][..],
+                "takes no --apps",
+            ),
+            (
+                &[
+                    "--gen-certs",
+                    "--issue-node",
+                    "6",
+                    "--control-cluster",
+                    CID,
+                    "--control-voters",
+                    "1=10.0.0.2",
+                ][..],
+                "takes no --control-cluster",
+            ),
+            (
+                &["--gen-certs", "--issue-node", "0"][..],
+                "is not a node number",
+            ),
+            (
+                &["--gen-certs", "--issue-node", "x"][..],
+                "is not a node number",
+            ),
+        ] {
+            assert!(
+                matches!(parsed(argv), Err(text) if text.contains(refused)),
+                "{argv:?}: {:?}",
+                parsed(argv).map(|_| ())
+            );
+        }
     }
 
     /// A 3-voter mutual-TLS rEtcd of cluster `cluster` granting only the `rdb` client, a
@@ -2808,5 +3224,37 @@ mod tests {
             "over TLS the boot is written before the bind"
         );
         drop(held);
+    }
+
+    /// #80 S4: SIGTERM stops a node run as rdb_node. Once `listen_for_term` is installed, the
+    /// process sends itself SIGTERM and the flag the serve loop reads turns true within 5 s.
+    /// Unit (no node process). Cut: the listener is not installed; SIGTERM's default action
+    /// kills the test binary.
+    #[cfg(unix)]
+    #[config_log::retcd_test]
+    fn s80s4_sigterm_sets_the_serve_loops_stop_flag() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        // The row's own flag, so a serve elsewhere in this binary never sees it.
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        super::listen_for_term(&rt, &FLAG).expect("the listener installs");
+        let sent = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "kill -TERM: {sent}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !FLAG.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            FLAG.load(Ordering::SeqCst),
+            "SIGTERM sets the flag within 5 s"
+        );
     }
 }

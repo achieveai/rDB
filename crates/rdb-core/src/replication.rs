@@ -54,6 +54,7 @@ pub mod append;
 pub mod catchup;
 pub mod primary;
 pub mod progress;
+pub mod retention;
 pub mod source;
 pub mod wire;
 

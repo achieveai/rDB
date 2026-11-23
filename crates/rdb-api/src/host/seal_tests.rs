@@ -139,7 +139,7 @@ pub(super) fn control_behind_a_cut(trio: &mut Trio) -> Arc<Faults> {
 }
 
 /// Three bootstrapped hosts with node 1 lagging, and its control store behind a cut.
-fn formed(dir: &std::path::Path) -> (Trio, Arc<Faults>) {
+pub(super) fn formed(dir: &std::path::Path) -> (Trio, Arc<Faults>) {
     let mut trio = Trio::new(dir, tuned);
     let faults = control_behind_a_cut(&mut trio);
     trio.rt
@@ -166,7 +166,7 @@ fn formed(dir: &std::path::Path) -> (Trio, Arc<Faults>) {
 /// renewal landed, the old wait was then met only by the `Expired` fence's view (its
 /// `valid_through` is one tick before the fence), and the promote started after node 1 had
 /// already fenced. Every s5_26, s5_26b and s5d_39 failure in the it8 runs had that read.
-fn renewal_landed_then_no_more(trio: &mut Trio) {
+pub(super) fn renewal_landed_then_no_more(trio: &mut Trio) {
     let renewed_at = |trio: &Trio| trio.nodes[0].0.authority.view().renewed_at;
     let before = renewed_at(trio);
     trio.until("node 1's next renewal lands", |trio| {

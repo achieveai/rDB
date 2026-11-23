@@ -264,6 +264,8 @@ async fn run_async(args: &Args, rt: &tokio::runtime::Runtime) -> ExitCode {
         timeouts,
         dedup_cap: None,
         dedup_retention: None,
+        history_keep: None,
+        history_budget_bytes: None,
         local: Vec::new(),
         links: Some(links),
         client: ClientId(args.client_id),
