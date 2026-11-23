@@ -580,8 +580,11 @@ fn resume_config() -> rdb_core::contracts::membership::PartitionConfig {
 /// F1's `Recovered` at cutoff [`BARRIER`], naming node 1 primary. Its barrier requires the
 /// primary's copy alone, which proves the cutoff durable, so R1 builds node 1's primary at the
 /// cutoff (lead ruling B-R54) and the secondaries at the root. L1 goes live `Paused` at the cutoff
-/// (M7B-141) and needs every copy durable through it to leave.
-fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::KernelEvent {
+/// (M7B-141) and needs the pinned durable quorum through it to leave.
+fn resume_recovered(
+    history: &CanonicalHistory,
+    config: rdb_core::contracts::membership::PartitionConfig,
+) -> rdb_core::contracts::event::KernelEvent {
     use rdb_core::contracts::authority::{
         AuthorityView, DenyReason, FencingProof, PartitionMode, Revocation,
     };
@@ -648,7 +651,7 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
                 valid_through_tick: Tick(u64::MAX),
                 past_horizon: DenyReason::NoGrant,
             },
-            pinned_config: resume_config(),
+            pinned_config: config,
         },
         retained_status_map: RetainedStatusMap {
             predecessor_generation: Generation(RESUME_GEN.0 - 1),
@@ -668,12 +671,15 @@ fn resume_recovered(history: &CanonicalHistory) -> rdb_core::contracts::event::K
 /// through `SendEnvelopes`, one host flush per secondary at tick 50 makes each durable, and R1's
 /// tracker reports the predicate durable through 40 to L1 as `DurableAdvanced`: nothing about
 /// durability or progress is seeded.
-fn resume_plan(faults: &[StorageOp]) -> RunPlan {
+fn resume_plan(min_regular_acks: u8, faults: &[StorageOp]) -> RunPlan {
     let history = canonical_history(resume_lineage(), C1, BARRIER).expect("a canonical history");
+    let config = resume_config()
+        .with_min_regular_acks(min_regular_acks)
+        .expect("valid RF3 threshold");
     let mut plan = RunPlan::new(rdb_sim::sim::cluster::ClusterConfig {
         partitions: vec![rdb_sim::sim::cluster::PartitionSpec {
             partition: PARTITION,
-            config: resume_config(),
+            config: config.clone(),
         }],
         ..support::cluster()
     });
@@ -683,7 +689,7 @@ fn resume_plan(faults: &[StorageOp]) -> RunPlan {
         .map(|batch| (NodeId(1), batch.clone()))
         .collect();
     plan.preload_durable = vec![(NodeId(1), PARTITION, RESUME_GEN, DurableSeq(BARRIER))];
-    let recovered = resume_recovered(&history);
+    let recovered = resume_recovered(&history, config);
     plan.seed = (1..=3)
         .map(|node| SeedEvent {
             at: Tick::ZERO,
@@ -707,14 +713,14 @@ fn resume_plan(faults: &[StorageOp]) -> RunPlan {
 struct ResumeRun {
     lines: Vec<TraceEvent>,
     /// The durable watermark node 1's tracker holds for copies 2 and 3, and the predicate's floor
-    /// (`min_required_durable`, the primary included).
+    /// from `durable_per_predicate` for the pinned configuration.
     durable: (u64, u64, u64),
     /// L1's live mode on node 1 at the end.
     mode: Option<rdb_core::protection::Mode>,
 }
 
-fn resume_run(faults: &[StorageOp]) -> ResumeRun {
-    let plan = resume_plan(faults);
+fn resume_run(min_regular_acks: u8, faults: &[StorageOp]) -> ResumeRun {
+    let plan = resume_plan(min_regular_acks, faults);
     let mut runner = Runner::new(&plan).expect("a runner");
     let report = runner.run(plan.limits).expect("a run");
     assert!(
@@ -736,7 +742,13 @@ fn resume_run(faults: &[StorageOp]) -> ResumeRun {
     let durable = (
         durable_of(2),
         durable_of(3),
-        tracker.min_required_durable().0,
+        tracker
+            .durable_per_predicate()
+            .into_iter()
+            .find(|(version, _)| *version == C1)
+            .expect("pinned predicate")
+            .1
+             .0,
     );
     let mode = dispatcher
         .protection(NodeId(1), PARTITION)
@@ -787,7 +799,7 @@ fn admissions(lines: &[TraceEvent]) -> Vec<(u64, bool)> {
 fn m7b_147_the_storage_backed_fixture_without_the_flush_fault_resumes() {
     use rdb_core::contracts::trace::ProtectionPhase;
     support::preamble();
-    let run = resume_run(&[]);
+    let run = resume_run(1, &[]);
     assert_eq!(
         run.durable,
         (BARRIER, BARRIER, BARRIER),
@@ -839,7 +851,7 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
     use rdb_core::contracts::trace::ProtectionPhase;
     support::preamble();
 
-    let control = resume_run(&[]);
+    let control = resume_run(1, &[]);
     assert!(
         phases(&control.lines)
             .iter()
@@ -847,10 +859,13 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
         "control: without the fault the same fixture resumes"
     );
 
-    let run = resume_run(&[B, C].map(|node| StorageOp::Fail {
-        node,
-        fault: StorageFault::FlushFailed,
-    }));
+    let run = resume_run(
+        1,
+        &[B, C].map(|node| StorageOp::Fail {
+            node,
+            fault: StorageFault::FlushFailed,
+        }),
+    );
     let (b, c, floor) = run.durable;
     assert!(b < BARRIER, "B's failed flush proved nothing: {b}");
     assert!(c < BARRIER, "C's failed flush proved nothing: {c}");
@@ -884,6 +899,34 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
         Some(ProtectionPhase::Paused),
         "L1 is still Paused at the deadline"
     );
+}
+
+/// With the same RF3 membership and one failed flush, the configured threshold decides resume.
+#[retcd_test]
+fn i79_rf3_resume_respects_the_pinned_min_regular_acks() {
+    use rdb_core::contracts::storage::StorageFault;
+    use rdb_core::contracts::trace::ProtectionPhase::{Healthy, Paused};
+
+    support::preamble();
+    let c_short = [StorageOp::Fail {
+        node: C,
+        fault: StorageFault::FlushFailed,
+    }];
+    for (m, faults, c, floor, phase) in [
+        (1, c_short.as_slice(), 0, BARRIER, Healthy),
+        (2, c_short.as_slice(), 0, 0, Paused),
+        (2, &[][..], BARRIER, BARRIER, Healthy),
+    ] {
+        let run = resume_run(m, faults);
+        assert_eq!(run.durable, (BARRIER, c, floor), "m={m}");
+        assert_eq!(run.mode.map(|mode| mode.phase()), Some(phase), "m={m}");
+        let history = phases(&run.lines);
+        assert_eq!(history.last().map(|(_, phase)| *phase), Some(phase));
+        if phase == Paused {
+            assert!(history.iter().all(|(_, p)| *p == Paused), "{history:?}");
+            assert!(admissions(&run.lines).iter().all(|(_, allow)| !allow));
+        }
+    }
 }
 
 // =============================================================================================
@@ -1935,7 +1978,7 @@ fn stack_first_acks_of(trace: &[TraceEvent], seq: u64) -> Vec<(NodeId, u64)> {
 /// 97 stays published: `qualifies_now(97)` is still true through [`LAGGARD`].
 ///
 /// L1's clause, as landed (B-R47a/B-R47b, pinned by M7B-224): the anchor is the recovery cutoff,
-/// L1 only admits once every required copy is durable through the barrier, so [`LAGGARD`] holds
+/// L1 admits once the pinned quorum is durable through the barrier. In this fixture [`LAGGARD`] holds
 /// the anchor and one divergence never flips `qualifies_now(anchor)`; the head never reports
 /// `Lost`. So L1 sees **no** `QualificationChanged{Lost}` in either sub-case, and the row pins
 /// that instead of the plan's "exactly one iff C did not ACK 98": a `Lost` pauses L1 in the

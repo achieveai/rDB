@@ -12237,18 +12237,10 @@ mod tests {
         assert!(gave_up.is_empty(), "{gave_up:?}");
     }
 
-    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts and stops
-    /// advancing, L1 pauses writes; a put refused then was refused at admission and never
-    /// queued, so a retry of it must not promise that `status` will show its outcome: status
-    /// stays `Unknown` for good. A retry of the published put keeps the promise, since status
-    /// shows it (review F-023). Since A-R256(2) node 1 re-plans after the restart and writes
-    /// resume once node 3 syncs, so node 3's link is held once the re-plan includes it, and the
-    /// published put is made under that hold at the re-planned generation: it stays unsafe and
-    /// brings the pause (A-R371), and the refusals still name the restart.
-    /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
+    /// After node 3 restarts, hold its link and node 2's background fsync. The next
+    /// write publishes through node 2, but neither secondary is durable through it. During
+    /// the resulting pause, status distinguishes that write from a fresh admission refusal.
     #[test]
-    #[ignore = "#79: one held copy of three no longer pauses (the put is durable on 1 and 2), \
-                and a `Db` row has no flush hold to make a published put unsafe; re-cut in #248"]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
@@ -12310,9 +12302,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         db.links().hold(OWNER, NodeId(3));
+        let node_two = dir.path().join("nodes/2");
+        let (entered, release) = host::hold_sync(&node_two);
         let first = db
             .put(b"a", b"2", None)
             .expect("node 2 publishes a put node 3 cannot hold");
+        entered
+            .recv_timeout(patience)
+            .expect("node 2 reached its held fsync");
         owner_when(&db, "L1 pauses", patience, &|node| {
             node.admits == Some(false)
         });
@@ -12347,7 +12344,7 @@ mod tests {
 
         // Review F-023, mutant U3: a published request is not in flight either (just checked),
         // so only the status half of `status_will_show` keeps its retry's promise.
-        let published = db.resend(*first.sent).expect_err("still paused");
+        let published = db.resend((*first.sent).clone()).expect_err("still paused");
         assert_eq!(
             published.error.kind,
             ErrorKind::ProtectionPaused,
@@ -12361,10 +12358,63 @@ mod tests {
             "published, so status shows it: {published:?}"
         );
         assert!(
-            !matches!(db.status(first.request, None), Ok(TxnStatus::Unknown)),
+            matches!(db.status(first.request, None), Ok(TxnStatus::Resolved(_))),
             "and status does"
         );
+        let snapshot = owner_status(&db, "paused owner after publication");
+        assert_eq!(snapshot.in_flight, None);
+        drop(release);
         db.shutdown();
+
+        // P1 currently produces only Resolved or Unknown. Exercise the reserved Unresolved
+        // reply through the same public resend using the published request and owner snapshot.
+        let (stub, mailbox, _rt) = unanswered(Duration::from_secs(1));
+        let id = first.request;
+        let seq = first.seq;
+        let responder = std::thread::spawn(move || {
+            while let Ok(msg) = mailbox.recv() {
+                match msg {
+                    Msg::Inspect { reply, .. } => reply.send(snapshot.clone()).expect("owner look"),
+                    Msg::Client(Client {
+                        call: ClientCall::Resend { .. },
+                        reply,
+                        ..
+                    }) => {
+                        reply
+                            .send(Answer::Error {
+                                error: ApiError::new(
+                                    ErrorKind::ProtectionPaused,
+                                    "paused".to_owned(),
+                                ),
+                                request: None,
+                            })
+                            .expect("resend");
+                    }
+                    Msg::Client(Client {
+                        call: ClientCall::Status { identity, .. },
+                        reply,
+                        ..
+                    }) => {
+                        assert_eq!(identity.request, id);
+                        reply
+                            .send(Answer::Status(TxnStatus::Unresolved { seq }))
+                            .expect("status");
+                    }
+                    _ => break,
+                }
+            }
+        });
+        let refused = stub.resend(*first.sent).expect_err("still paused");
+        assert_eq!(refused.error.kind, ErrorKind::ProtectionPaused);
+        assert!(
+            refused
+                .error
+                .detail
+                .ends_with(&format!("status {} shows its outcome", id.0)),
+            "{refused:?}"
+        );
+        drop(stub);
+        responder.join().expect("stub owner");
     }
 
     /// The tester's Q-A probe (lead ruling: fix it in rdb-api). Kernel checks 2 (deadline)

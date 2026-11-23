@@ -2192,7 +2192,7 @@ struct Unreachable {
 
 /// Issue #79 (option A): a regular secondary below the durable quorum floor that L1 reads, since
 /// when, and the floor it was below then ([`Host::warn_lagging`]). It clears when the copy
-/// reaches `target`, so a copy that keeps up with a moving floor never warns.
+/// reaches `min(target, current floor)`, so a copy that keeps up with a moving floor never warns.
 #[derive(Debug, Clone, Copy)]
 struct Lagging {
     since: Tick,
@@ -9272,6 +9272,7 @@ impl Host {
     /// predicate for `pause_age_millis`, where L1 used to start refusing, is logged once at
     /// Warn as `copy_durable_lagging`. Its entry clears, with Info `copy_durable_lag_cleared`
     /// when it had warned, once the copy is durable through the floor it was first found below,
+    /// or the current floor if that is lower,
     /// and is re-armed at once if it is still below the floor then. In RF2 no copy can sit
     /// below the floor, so it never fires there.
     ///

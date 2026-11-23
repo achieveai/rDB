@@ -593,6 +593,49 @@ fn m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped() {
     }
 }
 
+/// Model the state after a same-host re-plan lowered the pinned floor: the warning still
+/// carries the old target. A linked copy through the current floor must leave the drop clock.
+#[config_log::retcd_test]
+fn i79_a_warned_copy_through_the_lower_current_floor_is_not_dropped() {
+    const METHOD: &str = "i79_a_warned_copy_through_the_lower_current_floor_is_not_dropped";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, before) = started(dir.path(), tuned);
+    let copy = copy_of(&trio, 3);
+    let partition = PartitionId(1);
+    let now = trio.clock.now();
+    let owner = &mut trio.nodes[0].0;
+    let tracker = owner
+        .replication
+        .primary(owner.node, partition)
+        .expect("pinned primary")
+        .tracker();
+    let durable = tracker.peer(copy).expect("node 3 tracked").progress.durable;
+    let floor = tracker
+        .durable_per_predicate()
+        .into_iter()
+        .find(|(version, _)| *version == tracker.config().config_version)
+        .expect("pinned floor")
+        .1;
+    assert!(durable >= floor);
+    owner.lagging.insert(
+        (partition, copy),
+        Lagging {
+            since: now,
+            warned_at: now,
+            warned: true,
+            target: DurableSeq(durable.0 + 1),
+        },
+    );
+    owner.warn_lagging(partition, now);
+    assert!(!owner.lagging.contains_key(&(partition, copy)));
+    assert!(logged!(METHOD, "copy_durable_lag_cleared")
+        .iter()
+        .any(|line| line["copy"] == copy.0));
+    pass(&mut trio, 2 * DROP_AFTER_MILLIS);
+    assert!(logged!(METHOD, "membership_drop_planned").is_empty());
+    assert!(matches!(trio.ask(put(1)), Answer::Txn { result, .. } if result.generation == before));
+}
+
 /// b8's durable rule (A-R282 N1) where nothing else starts the clock again: the same copy,
 /// blamed at check after check, keeps its clock while its durable sequence stands, and gets a
 /// new one when it advances. A different copy gets a new clock too.
@@ -4496,16 +4539,8 @@ fn m11_t7_b_a_move_between_two_regular_copies_says_none_runs_here() {
 fn m11_t3_a_moved_off_source_is_not_added_back_by_its_restart() {
     let dir = config_testkit::fs::temp_dir();
     let (mut trio, before) = started(dir.path(), tuned);
-    kill(&trio, 3, &[1, 2]);
-    put_until_drop_planned(&mut trio, 1);
-    trio.until("node 1 decided to drop node 3", |trio| {
-        matches!(
-            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
-            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
-                if replan.drop == Some(NodeId(3))
-        )
-        .then_some(())
-    });
+    // The drop may commit while a put is being answered. Record the pending move before
+    // disconnecting its source so the committing host always observes it.
     trio.nodes[0].0.moves.insert(
         PartitionId(1),
         CopyMove {
@@ -4516,7 +4551,14 @@ fn m11_t3_a_moved_off_source_is_not_added_back_by_its_restart() {
             lagged: false,
         },
     );
+    kill(&trio, 3, &[1, 2]);
+    put_until_drop_planned(&mut trio, 1);
     dropped_three(&mut trio, before);
+    assert_eq!(
+        trio.nodes[0].0.moved.get(&PartitionId(1)),
+        Some(&(NodeId(3), NodeId(2))),
+        "the commit completed the move from node 3"
+    );
     trio.links.heal_all();
     restart(&mut trio, dir.path(), 3);
     pass(&mut trio, 3_000);

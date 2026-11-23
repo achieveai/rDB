@@ -2737,34 +2737,35 @@ fn m7v_38_lag_unsafe_age_reset_by_a_config_version_change_violates() {
     );
     assert!(signature.detail.contains("1800"), "{}", signature.detail);
 
-    // Near-miss: the same drop **with** a retirement barrier — the paused prefix really did
-    // become durable on every pinned copy.
-    let retired = base("m7v-38b")
-        .at(2_000)
-        .push(protection(
-            ProtectionPhase::Paused,
-            1_800,
-            &[N1, N2, N3],
-            ConfigVersion(3),
-            Seq(40),
-            Seq(40),
-            None,
-        ))
-        .flush(N1, Seq(40))
-        .flush(N2, Seq(40))
-        .flush(N3, Seq(40))
-        .at(2_100)
-        .push(protection(
-            ProtectionPhase::Paused,
-            0,
-            &[N1, N2, N3],
-            ConfigVersion(4),
-            Seq(40),
-            Seq(40),
-            None,
-        ))
-        .build();
-    proven(&judge(&retired), Invariant::Lag);
+    // A quorum retires the prefix with N3 either durable through 40 or one record short.
+    for third in [Seq(40), Seq(39)] {
+        let retired = base("m7v-38b")
+            .at(2_000)
+            .push(protection(
+                ProtectionPhase::Paused,
+                1_800,
+                &[N1, N2, N3],
+                ConfigVersion(3),
+                Seq(40),
+                Seq(40),
+                None,
+            ))
+            .flush(N1, Seq(40))
+            .flush(N2, Seq(40))
+            .flush(N3, third)
+            .at(2_100)
+            .push(protection(
+                ProtectionPhase::Paused,
+                0,
+                &[N1, N2, N3],
+                ConfigVersion(4),
+                Seq(40),
+                Seq(40),
+                None,
+            ))
+            .build();
+        proven(&judge(&retired), Invariant::Lag);
+    }
 }
 
 #[retcd_test]
