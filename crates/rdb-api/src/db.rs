@@ -3787,6 +3787,8 @@ impl Db {
                             // the bound, then the retryable `TimedOut` (PR #238 review).
                             None => {
                                 tracing::info!(owner = node.0, reason, "ready_replan_unanswered");
+                                // What was known before the ask still holds.
+                                replanning = was_replanning;
                             }
                             // The recovery moved on since the look (it may admit now): look again.
                             Some((now, _))
@@ -7754,7 +7756,9 @@ impl Db {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
                     format!(
-                        "partition 1's possible-loss record for generation {} stands on node {},                          which this process does not run and which is not the owner: nothing                          was cleared; run the ack from node {}'s process",
+                        "partition 1's possible-loss record for generation {} stands on node {}, \
+                         which this process does not run and which is not the owner: nothing \
+                         was cleared; run the ack from node {}'s process",
                         loss.generation.0, loss.copy.0, loss.copy.0
                     ),
                 ));
@@ -7773,7 +7777,8 @@ impl Db {
             None => Err(ApiError::new(
                 ErrorKind::Unavailable,
                 format!(
-                    "no answer to the ack-possible-loss in {:?}; it may have cleared the record:                      read node status, or ack again",
+                    "no answer to the ack-possible-loss in {:?}; it may have cleared the record: \
+                     read node status, or ack again",
                     self.timeouts.read
                 ),
             )),
@@ -7795,7 +7800,8 @@ impl Db {
             ApiError::new(
                 ErrorKind::Unavailable,
                 format!(
-                    "node {} {why}, so whether it holds partition 1's possible-loss record is                      unknown: nothing was cleared; ack again once it answers",
+                    "node {} {why}, so whether it holds partition 1's possible-loss record is \
+                     unknown: nothing was cleared; ack again once it answers",
                     node.0
                 ),
             )
@@ -13379,11 +13385,19 @@ mod tests {
             let answered = Arc::clone(&answered);
             std::thread::spawn(move || {
                 while let Ok(msg) = mailbox.recv() {
-                    if let Msg::Inspect { reply, .. } = msg {
-                        let at = std::time::Instant::now();
-                        if reply.send(status.clone()).is_ok() {
-                            lock(&answered).get_or_insert(at);
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let at = std::time::Instant::now();
+                            if reply.send(status.clone()).is_ok() {
+                                lock(&answered).get_or_insert(at);
+                            }
                         }
+                        // PR #238 review: as a host answers it, with no boot re-plan pending.
+                        // An ask left unanswered is unknown, not "not pending".
+                        Msg::BootReplan { reply, .. } => {
+                            let _ = reply.send((status.clone(), false));
+                        }
+                        _ => {}
                     }
                 }
             })
@@ -13847,14 +13861,15 @@ mod tests {
             });
             let answer = db.wait_ready(Duration::from_millis(400));
             let waited = started.elapsed();
-            assert!(
-                waited < Duration::from_millis(1200),
-                "answered after {waited:?}"
-            );
-            // Let the stub's mailbox close.
+            // Let the stub's mailbox close before any assert, so a red ends the scope.
             lock(&db.nodes).clear();
-            answer
+            (answer, waited)
         });
+        let (answer, waited) = answer;
+        assert!(
+            waited < Duration::from_millis(1200),
+            "answered after {waited:?}"
+        );
         assert!(
             matches!(answer, Err(ReadyError::TimedOut { within_ms: 400, .. })),
             "{answer:?}"
