@@ -9629,7 +9629,7 @@ fn s80s4_a_refill_is_refused_onto_a_member_or_a_used_slot_and_fills_the_free_one
         "already has 3 regular copies",
     );
     kill(&trio, 3, &[1, 2, 4, 5]);
-    let (request, _) = put_until_paused(&mut trio, 2);
+    let (request, _) = put_until_drop_planned(&mut trio, 2);
     dropped_three(&mut trio, before);
     for (to, guard, says) in [
         (1, "owner", "node 1 owns partition 1"),
@@ -9713,7 +9713,7 @@ fn five_with_three_dropped(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> (
     let (before, _, members) = commit_of(&trio).expect("bootstrap committed");
     assert_eq!(members, vec![1, 2, 3]);
     kill(&trio, 3, &[1, 2, 4, 5]);
-    let (request, _) = put_until_paused(&mut trio, 1);
+    let (request, _) = put_until_drop_planned(&mut trio, 1);
     dropped_three(&mut trio, before);
     (trio, request)
 }
