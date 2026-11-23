@@ -923,7 +923,7 @@ fn f1_slow_catch_up() -> RunPlan {
 /// landing and never catches up (`m10_land_link`), and under arm 3 one holding 19 catches up a
 /// single record, so either would no longer test the pin. Do not restore 20 or 19.
 #[retcd_test]
-#[ignore = "#79 option A: B and C are the durable quorum, so L1 no longer holds writes for A and P > C is reachable; rewritten for P > C in the #79 follow-up"]
+#[ignore = "#79 option A: B and C are the durable quorum, so L1 no longer holds writes for A and P > C is reachable; rewritten for P > C in #248"]
 fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
     let (replies, trace, violations) = run_judged(&f1_slow_catch_up());
     let caught_up = applied_on(&trace, A_NODE)
