@@ -2361,6 +2361,31 @@ What a `TimedOut` message says the owner last answered:
 failed repair, and prints `not ready: ...` and exits 5 for `TimedOut`, `Stopped`, `Blocked`,
 `Quarantined` and `Faulted`.
 
+### An rEtcd directory from an older build
+
+This is about rEtcd's data, under the `--dir` you gave `scripts/local-cluster.sh`, not your rDB
+folder. Storage format 4 moved each rEtcd node's Raft log into its own database, `raft-log/`,
+inside that node's data directory. **A node directory written by an older build (format 1 to
+3) is refused, not upgraded.**
+
+- The node exits with code 3 and logs `storage_open_failed` with a message explaining that the Raft log lives inside
+  the state-machine database. The separate `store_pre_split_layout` event records the node's
+  data directory in `path` and its old marker in `format_version` (0 when absent or unreadable). The check only reads, so the directory is left exactly as it was.
+- Your app then sees rEtcd as down: `OpenError::Control` at open.
+- **What to do:** run that rEtcd with the build that wrote it, or `clean` it and start fresh.
+  Replacing a single node in a surviving compatible cluster requires a fresh node id.
+- **`MissingLogStore`** means a node directory has only one of its two halves. Either
+  `raft-log/` is missing or empty next to stored data, or `raft-log/` holds Raft state and the
+  main database is missing or unbound. Restore the directory from where it came from. Do not make a new
+  `raft-log/`: that would lose the node's vote.
+- **`IdentityMismatch` naming `raft-log/`** means that `raft-log/` came from another node. Put
+  back the node's own one.
+
+**Format changes from here on (owner ruling, 2026-11-21).** From SBX's first real deploy on,
+every storage format change must migrate in place at startup and support a rolling upgrade,
+one node at a time. Until that deploy, a format bump refuses old folders with a typed error
+and no migration, as format 4 does. ADR-0008 records the rule.
+
 ## 7. The pilot, `pilot_kv`
 
 ```bash

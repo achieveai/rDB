@@ -2,16 +2,26 @@
 //!
 //! [`RocksStore`] is the same OpenRaft v2 storage implementation as
 //! [`EphemeralStore`](crate::EphemeralStore) — same apply semantics, same eight fault
-//! boundaries, same `state_hash` oracle — backed by one RocksDB instance per node.
+//! boundaries, same `state_hash` oracle — backed by two RocksDB instances per node.
 //!
-//! # Column families (ADR-0008 §9.2)
+//! # Two databases (format 4, #186, ADR-0008 note of 2026-11-21)
 //!
-//! | CF | Key | Value |
-//! |---|---|---|
-//! | `raft_log` | log index `u64` **big-endian** | `Entry<TypeConfig>` |
-//! | `raft_meta` | `vote`, `committed`, `last_purged` | `Vote` / `LogId` |
-//! | `kv` | user key bytes | [`Record`] |
-//! | `state_meta` | `format_version`, `identity`, `cluster_revision`, `last_applied`, `membership` | serialized (`format_version` excepted, see below) |
+//! The data directory root is the **state-machine database**; `<data_dir>/raft-log/`
+//! ([`LOG_DIR`]) is the **log database**. Each has its own WAL, so a log fsync no longer carries
+//! state-machine bytes and a state batch no longer syncs the log. Both handles live in one
+//! `RocksShared`, so the poison flag, the fault injector and the counters stay one fault model.
+//!
+//! | Database | CF | Key | Value |
+//! |---|---|---|---|
+//! | log | `raft_log` | log index `u64` **big-endian** | `Entry<TypeConfig>` |
+//! | log | `raft_meta` | `vote`, `committed`, `last_purged`, `identity` | `Vote` / `LogId` / identity |
+//! | root | `kv` | user key bytes | [`Record`] |
+//! | root | `state_meta` | `format_version`, `identity`, `cluster_revision`, `last_applied`, `membership` | serialized (`format_version` excepted, see below) |
+//!
+//! All of `raft_meta` sits with the log because its ordering rules need the log's WAL:
+//! `committed` must not be durable ahead of the entries it names (I3), and `last_purged` lands
+//! in the same batch as its range delete. The format marker lives only in the root database;
+//! the log database carries the `identity` copy so the two halves can be paired at open (I6).
 //!
 //! Values are [`postcard`]-encoded. The canonical bytes of a [`Command`](config_core::Command)
 //! are *not* what is stored: a log entry is an OpenRaft `Entry`, whose payload carries the
@@ -105,9 +115,10 @@ use crate::trace::TraceRegistry;
 use crate::types::{RaftNode, RaftNodeId, TypeConfig};
 use crate::util::{io_error, key_hex, outcome_name};
 
-/// Raft log entries, keyed by big-endian log index.
+/// Raft log entries, keyed by big-endian log index. Lives in the log database ([`LOG_DIR`]).
 pub const CF_RAFT_LOG: &str = "raft_log";
-/// Durable vote and log metadata (`vote`, `committed`, `last_purged`).
+/// Durable vote and log metadata (`vote`, `committed`, `last_purged`, and the `identity` copy
+/// that pairs the log database with the state-machine database). Lives in [`LOG_DIR`].
 pub const CF_RAFT_META: &str = "raft_meta";
 /// Materialized user records, keyed by the user key bytes.
 pub const CF_KV: &str = "kv";
@@ -139,35 +150,36 @@ pub const CF_DEDUP: &str = "dedup";
 /// any serde field addition, removal, or reorder in a persisted type, since every value except
 /// this marker is a `postcard` encoding of such a type (ADR-0008 note of 2026-09-18).
 /// Version 2 added the [`CF_EVENTS`] journal and the `compact_revision` watermark; version 3
-/// adds the [`CF_DEDUP`] family and the `retired_nodes` set. A v1 or v2 directory is migrated
-/// forward once, on open (ADR-0021); a v4 directory is refused, because a build cannot know
-/// what a format newer than itself means.
-pub const FORMAT_VERSION: u32 = 3;
+/// added the [`CF_DEDUP`] family and the `retired_nodes` set; version 4 moves the Raft log into
+/// its own database under [`LOG_DIR`] (#186). A directory from any earlier build keeps its log
+/// inside the root database and is refused with [`StorageOpenError::PreSplitLayout`], not
+/// migrated: no deploy exists yet (owner ruling of 2026-11-21, ADR-0008). A v5 directory is
+/// refused, because a build cannot know what a format newer than itself means.
+pub const FORMAT_VERSION: u32 = 4;
 
-/// Exactly the column families an M5 data directory may contain (ADR-0008 §9.2).
+/// The log database's directory, relative to the data directory (format 4, #186).
+pub const LOG_DIR: &str = "raft-log";
+
+/// Where the log database of the data directory `data_dir` lives.
+pub fn log_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(LOG_DIR)
+}
+
+/// Exactly the column families the **root** (state-machine) database may contain (ADR-0008
+/// §9.2, format 4).
 ///
 /// A directory carrying any other family is a later schema version and is refused rather than
-/// silently reinterpreted (spec §17).
-pub const COLUMN_FAMILIES: [&str; 6] = [
-    CF_RAFT_LOG,
-    CF_RAFT_META,
-    CF_KV,
-    CF_STATE_META,
-    CF_EVENTS,
-    CF_DEDUP,
-];
+/// silently reinterpreted (spec §17). `raft_log` there means the opposite: an *earlier* build,
+/// refused as [`StorageOpenError::PreSplitLayout`].
+pub const COLUMN_FAMILIES: [&str; 4] = [CF_KV, CF_STATE_META, CF_EVENTS, CF_DEDUP];
 
-/// The v2 column-family set, kept so the migration can recognise a directory written by an M4
-/// build — which legitimately has no `dedup` — instead of refusing it as incomplete.
-const COLUMN_FAMILIES_V2: [&str; 5] = [CF_RAFT_LOG, CF_RAFT_META, CF_KV, CF_STATE_META, CF_EVENTS];
+/// Exactly the column families the log database ([`LOG_DIR`]) may contain.
+pub const LOG_COLUMN_FAMILIES: [&str; 2] = [CF_RAFT_LOG, CF_RAFT_META];
 
-/// The v1 column-family set, kept so the migration can recognise a directory written by an
-/// M2/M3 build — which legitimately has no `events` — instead of refusing it as incomplete.
-const COLUMN_FAMILIES_V1: [&str; 4] = [CF_RAFT_LOG, CF_RAFT_META, CF_KV, CF_STATE_META];
-
-/// The pre-journal format. Migrated forward on open.
+/// The pre-journal marker. A split directory stamped 1 is what a `--compat-schema 1` node
+/// writes (M6-R22), and it is migrated forward on open.
 const FORMAT_VERSION_V1: u32 = 1;
-/// The M4 format: journal, no dedup family. Migrated forward on open.
+/// The M4 marker. Migrated forward on open, like [`FORMAT_VERSION_V1`].
 const FORMAT_VERSION_V2: u32 = 2;
 
 const KEY_VOTE: &[u8] = b"vote";
@@ -306,6 +318,43 @@ pub enum StorageOpenError {
         expected: Vec<String>,
     },
 
+    /// The directory keeps its Raft log inside the state-machine database, as every build
+    /// before format 4 did (#186). This build keeps the log in `{path}/raft-log` and does not
+    /// migrate: no deploy exists yet, so the owner ruled on 2026-11-21 to refuse old folders
+    /// with this typed error until the first real deploy (ADR-0008). The refusal is read-only,
+    /// so the directory is left as it was found and no `raft-log/` is created.
+    #[error(
+        "data directory {path} keeps the Raft log inside the state-machine database \
+             (format {found}); this build keeps it in {path}/raft-log and cannot migrate it: \
+             return to the build that wrote it or start fresh. To replace a node in a surviving compatible cluster, use a fresh node id"
+    )]
+    PreSplitLayout {
+        /// The format marker the directory carries, or `0` when absent or unreadable.
+        found: u32,
+        /// The directory.
+        path: PathBuf,
+    },
+
+    /// One half of a split store is absent while the other half holds state (#186, I6).
+    ///
+    /// The usual shape is a state-machine database with applied state and no log database (or
+    /// an empty one) beside it. Recreating the log there would lose the durable vote, which is a
+    /// double-vote hazard, so the open refuses instead. A log with a vote, an entry or a pointer
+    /// requires a bound state machine. An absent root or a root without an identity is refused,
+    /// naming the root.
+    #[error(
+        "data directory {path} is missing half of its store: {missing} is absent or empty while \
+             the other half holds Raft state; recreating it would lose {}",
+        if missing == path { "the applied state" } else { "the durable vote" }
+    )]
+    MissingLogStore {
+        /// The data directory.
+        path: PathBuf,
+        /// The half that is missing: `{path}/raft-log` normally, `{path}` itself in the reverse
+        /// case.
+        missing: PathBuf,
+    },
+
     /// A legacy-format directory still holds Raft log entries this build cannot carry across an
     /// in-place upgrade (ADR-0021 note 4, ruling M5-R19 as amended by ruling M6-R20).
     ///
@@ -321,8 +370,7 @@ pub enum StorageOpenError {
     /// applied. A residual of applied, decodable entries -- which is all OpenRaft's purge ever
     /// leaves behind -- is not an obstacle and never was.
     ///
-    /// The fix depends on which build wrote the directory, so the message does too -- see
-    /// [`drained_log_remedy`], and finding F-016 for why naming only the drain was wrong.
+    /// [`drained_log_remedy`] selects the recovery procedure for the admitted split directory's marker.
     #[error(
         "data directory {path} is on-disk format version {format} and {log_entries} of its \
              Raft log entrie(s) cannot be carried across an in-place upgrade -- this build \
@@ -374,33 +422,17 @@ pub enum StorageOpenError {
 /// The operator procedure that actually clears [`StorageOpenError::UpgradeRequiresDrainedLog`]
 /// on a directory stamped `format`.
 ///
-/// Finding F-016: the single message this replaced told every operator to "trigger a snapshot
-/// and let log purge drain the rest", which is unperformable on the only build that ships a
-/// `format_version` 1 directory. That build is M0-M3 (`main`, 7d524ac): it has no snapshot
-/// engine and no admin plane, so there is nothing to trigger and nothing to purge with. An
-/// error that names a remedy the reader cannot carry out is worse than one that names none,
-/// because it sends them looking for a command that does not exist.
-///
-/// The `format` 1 arm therefore names the path that works on any build: discard the directory
-/// and let the node rejoin as a fresh learner, which is ADR-0023's node-replacement flow and
-/// needs nothing from the old binary at all. The second sentence is for the other producer of
-/// a marker-1 directory -- this build running `--compat-schema 1`, which stamps its *ceiling*
-/// (OQ-65, ruling M6-R22) -- where the drain is available and is much the cheaper answer.
-///
-/// `format` 2 keeps the original wording: every build that writes that marker is an M4-or-later
-/// build from this line, which does have both.
+/// Only split directories pass the layout probe. Format 1 can be written by a pinned node;
+/// a manually stamped split directory can also carry format 2.
 fn drained_log_remedy(format: &u32) -> &'static str {
     if *format == FORMAT_VERSION_V1 {
-        "the build that writes an on-disk format version 1 directory has no snapshot engine \
-         and no admin plane, so its log cannot be drained in place -- move this node's data \
-         directory aside and let it rejoin the cluster as a fresh learner from a surviving \
-         member, which needs nothing from the older build. If instead this directory was \
-         written by this build under `--compat-schema 1`, restart it pinned, let it finish \
-         applying, trigger a snapshot and let log purge drain the rest, then retry unpinned"
+        "restart with `--compat-schema 1` if the retained entries can be applied pinned, \
+         finish applying them, trigger a snapshot and let log purge drain the rest, then retry \
+         unpinned. Otherwise replace the node as a fresh learner with a fresh node id from a \
+         surviving compatible member, or start a fresh cluster"
     } else {
-        "on the previous build, let the node catch up so nothing is unapplied, trigger a \
-         snapshot and let log purge drain the rest, shut the node down, then start this build \
-         against the drained directory"
+        "recover the split directory from a compatible backup, replace the node as a fresh \
+         learner with a fresh node id from a surviving compatible member, or start a fresh cluster"
     }
 }
 
@@ -537,7 +569,11 @@ impl AppliedView {
 }
 
 struct RocksShared {
+    /// The state-machine database at the data directory root.
     db: DB,
+    /// The log database at `<data_dir>/raft-log/` ([`LOG_DIR`]). Every log, vote, committed
+    /// and purge write goes here, so its WAL alone orders them (I3, I5).
+    log_db: DB,
     path: PathBuf,
     identity: ClusterIdentity,
     sync_writes: bool,
@@ -606,8 +642,8 @@ struct RocksShared {
     /// A purge OpenRaft ordered before this node could prove it was covered, held until the
     /// install that justifies it commits.
     ///
-    /// In memory only, and deliberately so (ruling M5-R11): it is executed inside the install's
-    /// final synced batch, after `current_snapshot` is durable, and dropped without executing
+    /// In memory only, and deliberately so (ruling M5-R11): it is executed in a separate synced log
+    /// batch after the install's final state batch makes `current_snapshot` durable, and dropped without executing
     /// if that install aborts or the process restarts. Persisting it would mean a crash could
     /// resurrect a deletion whose justification never landed.
     pending_purge: Mutex<Option<LogId<RaftNodeId>>>,
@@ -843,12 +879,20 @@ impl RocksShared {
         self.boundary(boundary, subject, verb)
     }
 
+    /// A state-machine column family ([`COLUMN_FAMILIES`]).
     fn cf(&self, name: &str) -> &ColumnFamily {
         // Every column family is verified present by `open`, which refuses the directory
         // otherwise, so this cannot be `None` on a live store.
         self.db
             .cf_handle(name)
             .unwrap_or_else(|| unreachable!("column family {name} verified at open"))
+    }
+
+    /// A log column family ([`LOG_COLUMN_FAMILIES`]).
+    fn log_cf(&self, name: &str) -> &ColumnFamily {
+        self.log_db
+            .cf_handle(name)
+            .unwrap_or_else(|| unreachable!("log column family {name} verified at open"))
     }
 
     fn write_options(&self, sync: bool) -> WriteOptions {
@@ -870,9 +914,32 @@ impl RocksShared {
         subject: ErrorSubject<RaftNodeId>,
         verb: ErrorVerb,
     ) -> Result<(), StorageError<RaftNodeId>> {
+        self.write_to(&self.db, batch, sync, subject, verb)
+    }
+
+    /// [`Self::write`] against the log database.
+    #[allow(clippy::result_large_err)]
+    fn write_log(
+        &self,
+        batch: WriteBatch,
+        sync: bool,
+        subject: ErrorSubject<RaftNodeId>,
+        verb: ErrorVerb,
+    ) -> Result<(), StorageError<RaftNodeId>> {
+        self.write_to(&self.log_db, batch, sync, subject, verb)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn write_to(
+        &self,
+        db: &DB,
+        batch: WriteBatch,
+        sync: bool,
+        subject: ErrorSubject<RaftNodeId>,
+        verb: ErrorVerb,
+    ) -> Result<(), StorageError<RaftNodeId>> {
         let opts = self.write_options(sync);
-        self.db
-            .write_opt(batch, &opts)
+        db.write_opt(batch, &opts)
             .map_err(|e| self.fatal(subject.clone(), verb, format!("rocksdb write failed: {e}")))?;
         if sync && self.sync_writes {
             self.syncs.fetch_add(1, Ordering::SeqCst);
@@ -889,7 +956,9 @@ impl RocksShared {
         if !self.sync_writes {
             return Ok(());
         }
-        self.db.flush_wal(true).map_err(|e| {
+        // The log database's WAL: this is the log flush, and it no longer carries any
+        // state-machine bytes (#186).
+        self.log_db.flush_wal(true).map_err(|e| {
             self.fatal(
                 subject.clone(),
                 verb,
@@ -949,11 +1018,12 @@ impl RocksShared {
     }
 }
 
-/// The M2 persistent store: one RocksDB instance holding the Raft log, the durable vote and
-/// committed pointer, the materialized records, and the state-machine metadata.
+/// The M2 persistent store: two RocksDB instances under one data directory (format 4). The log
+/// database (`raft-log/`) holds the Raft log, the durable vote and the committed and purged
+/// pointers; the root database holds the materialized records and the state-machine metadata.
 ///
-/// Cheap to clone (one `Arc`); every clone shares one database handle. Dropping **all** clones
-/// closes the database and releases RocksDB's `LOCK` file — which is what a restart test must
+/// Cheap to clone (one `Arc`); every clone shares both database handles. Dropping **all** clones
+/// closes both databases and releases both RocksDB `LOCK` files — which is what a restart test must
 /// do before calling [`RocksStore::open`] on the same directory again (TA-16.1).
 #[derive(Clone)]
 pub struct RocksStore {
@@ -1033,15 +1103,20 @@ impl RocksStore {
             path: path.clone(),
             source,
         })?;
+        let log_path = log_dir(dir);
 
         // A directory with a `CURRENT` file already holds a database, so its column families
-        // are a fact to verify rather than something to create.
+        // are a fact to verify rather than something to create. The same goes for the log
+        // database under `raft-log/`.
         let existing = dir.join("CURRENT").exists();
-        // Which column families the directory really has. Kept past the probe because the
-        // v1 watermark stamp below keys on the *layout*, not the marker (M6-R22).
-        let mut layout = CfLayout::Current;
+        let log_existing = log_path.join("CURRENT").exists();
         if existing {
-            // The marker is read before *anything* else about the layout, because it is the
+            // Before anything else: a directory from a build before format 4 keeps the log in
+            // the root database. Every later check would misname that (an "unexpected"
+            // `raft_log` family), so the one pre-split probe runs first and read-only.
+            refuse_pre_split_layout(dir, &path)?;
+
+            // The marker is read before exact-family-set validation, because it is the
             // only fact that can tell an operator "this directory is newer than this build"
             // (OQ-65, M6-98). Read after `verify_column_families`, a directory from a newer
             // build reports a missing column family instead — a true statement that names the
@@ -1049,8 +1124,7 @@ impl RocksStore {
             // so it can neither create the family nor destroy the evidence.
             // Deliberately not `?`: a directory that is missing a *core* family cannot be
             // probed at all, and that case belongs to `verify_column_families` below, which
-            // names the family. Holding the result lets the nested arm raise the very same
-            // error at the very same point it always did.
+            // names the family.
             let marker = probe_format_version(dir, &path);
             if let Ok(Some(found)) = marker {
                 if found > options.max_format_version {
@@ -1070,69 +1144,56 @@ impl RocksStore {
                 }
             }
 
-            // A family that is absent is either a legitimately older directory or a current one
-            // someone deleted a family out of. The marker settles which, and it must be read
-            // *before* the writable open, whose `create_missing_column_families` would
-            // manufacture the family and destroy the evidence (M4-95).
-            layout = verify_column_families(dir, &path)?;
-            let (missing, marker_of_that_layout) = match layout {
-                CfLayout::Current => (None, FORMAT_VERSION),
-                CfLayout::LegacyV2 => (Some(CF_DEDUP), FORMAT_VERSION_V2),
-                CfLayout::LegacyV1 => (Some(CF_EVENTS), FORMAT_VERSION_V1),
-            };
-            if let Some(missing) = missing {
-                match marker? {
-                    Some(found) if found == marker_of_that_layout => {
-                        // Rulings M5-R19/M6-R20: migration upgrades state, never history, and
-                        // history it cannot carry is refused. Refused here -- still read-only,
-                        // nothing created -- so the directory the operator has to go back and
-                        // drain is byte-for-byte the one they left.
-                        refuse_if_undrained(&path, found, probe_log_for_upgrade(dir, &path)?)?;
-                    }
-                    found => {
-                        return Err(StorageOpenError::MissingColumnFamily {
-                            name: missing.to_string(),
-                            path: path.clone(),
-                            expected: COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
-                        })
-                        .inspect_err(|_| {
-                            tracing::error!(
-                                path = %path.display(),
-                                column_family = missing,
-                                format_version = found.unwrap_or(0),
-                                "missing_column_family"
-                            );
-                        });
-                    }
+            // A family that is absent must be refused *before* the writable open, whose
+            // `create_missing_column_families` would manufacture it over live data and destroy
+            // the evidence (M2-62, M4-95).
+            verify_column_families(dir, &path, &COLUMN_FAMILIES).inspect_err(|e| {
+                if let StorageOpenError::MissingColumnFamily { name, .. } = e {
+                    tracing::error!(
+                        path = %path.display(),
+                        column_family = %name,
+                        format_version = marker.as_ref().ok().copied().flatten().unwrap_or(0),
+                        "missing_column_family"
+                    );
                 }
-            }
+            })?;
         } else if !options.create_if_missing {
             return Err(StorageOpenError::Backend {
                 path: path.clone(),
                 detail: "no database present and create_if_missing is false".to_string(),
             });
         }
+        if log_existing {
+            verify_column_families(&log_path, &log_path, &LOG_COLUMN_FAMILIES)?;
+        }
 
-        let db = open_db(dir, &path)?;
+        // I6: both halves present with one identity, or both fresh. Which database opens first
+        // depends on which one already exists, so that a refusal never creates the other half.
+        let (db, preexisting_log) = if existing {
+            // Root first, so a live store's `Locked` still names the data directory (M2-64).
+            let db = open_db(dir, &path, &COLUMN_FAMILIES)?;
+            let log = if log_existing {
+                Some(open_db(&log_path, &log_path, &LOG_COLUMN_FAMILIES)?)
+            } else {
+                None
+            };
+            (db, log)
+        } else {
+            let log = if log_existing {
+                Some(open_db(&log_path, &log_path, &LOG_COLUMN_FAMILIES)?)
+            } else {
+                None
+            };
+            if let Some(log) = &log {
+                require_root_for_live_log(log, &path, &log_path)?;
+            }
+            (open_db(dir, &path, &COLUMN_FAMILIES)?, log)
+        };
 
         // First, before a single stored byte is decoded: every value below is a serde encoding
         // whose layout this version selects, so reading them out of a directory written in
         // another format is exactly the silent misinterpretation the marker exists to prevent.
         let format_action = check_format_version(&db, &path, options.max_format_version)?;
-        // Rulings M5-R19/M6-R20. A legacy directory may only be upgraded once every entry its
-        // log still holds is one this build can carry: decodable, and already applied.
-        // This runs before the open batch, so a refused directory is left exactly as it was
-        // found -- still readable by the build that wrote it, which is the build that has to
-        // drain it.
-        // Backstop for the one shape the read-only probe above cannot see: a directory whose
-        // column families are all current but whose marker is still legacy. The realistic
-        // case -- a legacy CF set -- is refused before `open_db` ran at all.
-        if let FormatAction::Migrate { from } = format_action {
-            refuse_if_undrained(&path, from, scan_log_for_upgrade(&db, &path)?)?;
-        }
-        // Created here rather than at the end so a fault injected *during* the migration is
-        // counted on the same counters the test later inspects (M4-14, M4-18).
-        let counters = Arc::new(FaultCounters::default());
 
         let stored_identity: Option<ClusterIdentity> = read_meta(&db, CF_STATE_META, KEY_IDENTITY)
             .map_err(|detail| StorageOpenError::Corrupt {
@@ -1140,6 +1201,58 @@ impl RocksStore {
                 path: path.clone(),
                 detail,
             })?;
+
+        if existing && stored_identity.is_none() {
+            if let Some(log) = &preexisting_log {
+                require_root_for_live_log(log, &path, &log_path)?;
+            }
+        }
+
+        // I6, the usual direction: applied state with no log database, or an empty one, next
+        // to it. Recreating the log would lose the durable vote. Refused before the log
+        // database is created, so the directory is left as it was found.
+        let log_identity: Option<ClusterIdentity> = match &preexisting_log {
+            None => None,
+            Some(log) => read_meta(log, CF_RAFT_META, KEY_IDENTITY).map_err(|detail| {
+                StorageOpenError::Corrupt {
+                    what: "raft_meta/identity".to_string(),
+                    path: log_path.clone(),
+                    detail,
+                }
+            })?,
+        };
+        if log_identity.is_none() && holds_persisted_state(&db, &path)? {
+            tracing::error!(
+                path = %path.display(),
+                missing = %log_path.display(),
+                "missing_log_store"
+            );
+            return Err(StorageOpenError::MissingLogStore {
+                path: path.clone(),
+                missing: log_path.clone(),
+            });
+        }
+
+        // Rulings M5-R19/M6-R20. A legacy marker may only be upgraded once every entry the log
+        // still holds is one this build can carry: decodable, and already applied. This runs
+        // before the open batch, so a refused directory is left exactly as it was found --
+        // still readable by the build that wrote it, which is the build that has to drain it.
+        // Since format 4 the only producer of a legacy marker is a `--compat-schema 1` node,
+        // which writes the split layout stamped 1 (M6-R22), so the scan reads the log database.
+        if let FormatAction::Migrate { from } = format_action {
+            let scan = match &preexisting_log {
+                Some(log) => scan_log_for_upgrade(&db, log, &path)?,
+                None => LogUpgradeScan::default(),
+            };
+            refuse_if_undrained(&path, from, scan)?;
+        }
+        let log_db = match preexisting_log {
+            Some(log) => log,
+            None => open_db(&log_path, &log_path, &LOG_COLUMN_FAMILIES)?,
+        };
+        // Created here rather than at the end so a fault injected *during* the migration is
+        // counted on the same counters the test later inspects (M4-14, M4-18).
+        let counters = Arc::new(FaultCounters::default());
 
         let state_meta =
             db.cf_handle(CF_STATE_META)
@@ -1152,27 +1265,28 @@ impl RocksStore {
         // One synced batch binds the identity and stamps the format version, so a directory can
         // never come back from a first open carrying one of them without the other.
         let mut open_batch = WriteBatch::default();
-        match stored_identity {
-            Some(stored) if stored != identity => {
-                tracing::error!(
-                    stored_cluster_id = %stored.cluster_id,
-                    configured_cluster_id = %identity.cluster_id,
-                    stored_node_id = stored.node_id.0,
-                    configured_node_id = identity.node_id.0,
-                    stored_recovery_epoch = stored.recovery_epoch.0,
-                    configured_recovery_epoch = identity.recovery_epoch.0,
-                    node_id = identity.node_id.0,
-                    path = %path.display(),
-                    "identity_mismatch"
-                );
-                // `db` drops here, releasing `LOCK`, so the caller can retry with the right
-                // identity without restarting the process.
-                return Err(StorageOpenError::IdentityMismatch {
-                    stored,
-                    configured: identity,
-                    path,
-                });
+        let mismatch = |stored: ClusterIdentity, at: &Path| {
+            tracing::error!(
+                stored_cluster_id = %stored.cluster_id,
+                configured_cluster_id = %identity.cluster_id,
+                stored_node_id = stored.node_id.0,
+                configured_node_id = identity.node_id.0,
+                stored_recovery_epoch = stored.recovery_epoch.0,
+                configured_recovery_epoch = identity.recovery_epoch.0,
+                node_id = identity.node_id.0,
+                path = %at.display(),
+                "identity_mismatch"
+            );
+            // Both handles drop on return, releasing both `LOCK`s, so the caller can retry with
+            // the right identity without restarting the process.
+            StorageOpenError::IdentityMismatch {
+                stored,
+                configured: identity,
+                path: at.to_path_buf(),
             }
+        };
+        match stored_identity {
+            Some(stored) if stored != identity => return Err(mismatch(stored, &path)),
             Some(_) => {
                 tracing::info!(
                     cluster_id = %identity.cluster_id,
@@ -1190,6 +1304,43 @@ impl RocksStore {
                 open_batch.put_cf(state_meta, KEY_IDENTITY, encoded);
             }
         }
+        // I6: the log database must belong to the same node as the state machine. With the
+        // root identity already equal to the configured one, comparing against the configured
+        // identity is comparing the two halves.
+        match log_identity {
+            Some(stored) if stored != identity => return Err(mismatch(stored, &log_path)),
+            Some(_) => {}
+            None => {
+                // The log half is bound first and synced on its own: a crash before the root
+                // batch below leaves a log holding only its identity, which the next open
+                // treats as fresh (I6).
+                let encoded =
+                    postcard::to_stdvec(&identity).map_err(|e| StorageOpenError::Backend {
+                        path: log_path.clone(),
+                        detail: format!("cannot encode identity: {e}"),
+                    })?;
+                let mut bind = WriteBatch::default();
+                bind.put_cf(
+                    log_db.cf_handle(CF_RAFT_META).ok_or_else(|| {
+                        StorageOpenError::MissingColumnFamily {
+                            name: CF_RAFT_META.to_string(),
+                            path: log_path.clone(),
+                            expected: LOG_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+                        }
+                    })?,
+                    KEY_IDENTITY,
+                    encoded,
+                );
+                let mut w = WriteOptions::default();
+                w.set_sync(true);
+                log_db
+                    .write_opt(bind, &w)
+                    .map_err(|e| StorageOpenError::Backend {
+                        path: log_path.clone(),
+                        detail: format!("cannot bind the log database's identity: {e}"),
+                    })?;
+            }
+        }
         if format_action != FormatAction::Proceed {
             // The ceiling, not [`FORMAT_VERSION`]: a `--compat-schema` node must leave behind a
             // directory it can itself reopen, and stamping a marker above its own ceiling would
@@ -1200,18 +1351,15 @@ impl RocksStore {
                 options.max_format_version.to_le_bytes(),
             );
         }
-        // Keyed on what the directory holds, not on `from` alone (M6-R22). A build pinned with
+        // Keyed on what the journal holds, not on `from` alone (M6-R22). A build pinned with
         // `--compat-schema 1` stamps marker 1 over the *current* column families, journal
-        // included (ADR-0030), so marker 1 no longer proves the history is unresumable.
+        // included (ADR-0030), so marker 1 does not prove the history is unresumable.
         // Stamping `cluster_revision` as the watermark over a populated journal would refuse
         // every watch resume and historical read below it, silently and for good
         // (`restore_compact_revision` unions by max). The watermark is stamped only when the
-        // journal cannot resume anything: the v1 layout (no `events` family yet), or an
-        // `events` family with nothing in it -- which is also what a v1 directory looks like
-        // on the retry after a crash between `open_db` creating the families and this batch
-        // (M4-14, M4-18).
+        // journal cannot resume anything: an `events` family with nothing in it.
         if matches!(format_action, FormatAction::Migrate { from } if from == FORMAT_VERSION_V1)
-            && (layout == CfLayout::LegacyV1 || journal_is_empty(&db))
+            && journal_is_empty(&db)
         {
             // Ruling R1: the watermark is stamped from *this node's* `cluster_revision`, as a
             // local open-time write, not a replicated command. The pre-v2 history has no
@@ -1281,7 +1429,7 @@ impl RocksStore {
         // machine per crash.
         sweep_partial_receives(&snap_dir);
 
-        let mut loaded = load_state(&db, &path, limits)?;
+        let mut loaded = load_state(&db, &log_db, &path, limits)?;
         // Before anything is served: a marker means the column families hold a mixture of the
         // old state and a partly written new one, which is not a state any reader may see
         // (ADR-0022 "Install: two-phase", test plan M5-33).
@@ -1289,10 +1437,11 @@ impl RocksStore {
             None => 0,
             Some(marker) => {
                 redo_install(&db, &path, &identity, options.command_schema, &marker)?;
-                loaded = load_state(&db, &path, limits)?;
+                loaded = load_state(&db, &log_db, &path, limits)?;
                 1
             }
         };
+        check_applied_within_log(&loaded, &path)?;
 
         // OQ-45. "Fresh" means *formable*, not *empty*: it is the gate `form_cluster` checks,
         // and what it has to exclude is a directory that has already been part of a cluster.
@@ -1356,6 +1505,7 @@ impl RocksStore {
         Ok(RocksStore {
             shared: Arc::new(RocksShared {
                 db,
+                log_db,
                 path,
                 identity,
                 sync_writes: options.sync_writes,
@@ -1604,8 +1754,8 @@ impl RocksStore {
     /// Number of entries currently present in the `raft_log` column family.
     pub fn raft_log_len(&self) -> u64 {
         self.shared
-            .db
-            .iterator_cf(self.shared.cf(CF_RAFT_LOG), IteratorMode::Start)
+            .log_db
+            .iterator_cf(self.shared.log_cf(CF_RAFT_LOG), IteratorMode::Start)
             .count() as u64
     }
 
@@ -1694,7 +1844,8 @@ fn open_boundary(
 /// With 16 it passed 20/20. Values between 2 and 16 are unmeasured; a lower one may do as well.
 const MAX_BACKGROUND_JOBS: i32 = 16;
 
-fn open_db(dir: &Path, path: &Path) -> Result<DB, StorageOpenError> {
+/// Open (creating if absent) one of the store's two databases with exactly `families`.
+fn open_db(dir: &Path, path: &Path, families: &[&str]) -> Result<DB, StorageOpenError> {
     let mut db_opts = Options::default();
     db_opts.create_if_missing(true);
     db_opts.create_missing_column_families(true);
@@ -1703,7 +1854,7 @@ fn open_db(dir: &Path, path: &Path) -> Result<DB, StorageOpenError> {
     let mut cf_opts = Options::default();
     cf_opts.set_compression_type(DBCompressionType::Lz4);
 
-    let descriptors: Vec<ColumnFamilyDescriptor> = COLUMN_FAMILIES
+    let descriptors: Vec<ColumnFamilyDescriptor> = families
         .iter()
         .map(|name| ColumnFamilyDescriptor::new(*name, cf_opts.clone()))
         .collect();
@@ -1724,28 +1875,45 @@ fn open_db(dir: &Path, path: &Path) -> Result<DB, StorageOpenError> {
     })
 }
 
-/// What an existing directory's column-family set says about the schema it was written with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CfLayout {
-    /// Exactly [`COLUMN_FAMILIES`]. Open it directly.
-    Current,
-    /// Exactly the v2 set: `events` but no `dedup`. A candidate for the v2 -> v3 migration,
-    /// *if* its format marker agrees.
-    LegacyV2,
-    /// Exactly the v1 set: no `events` and no `dedup`. A candidate for the v1 -> v3 migration,
-    /// *if* its format marker agrees — the marker, not the CF list, is the authority.
-    LegacyV1,
+/// Refuse a database whose column-family set is not exactly `expected`.
+///
+/// A missing family would otherwise be auto-created over live data by [`open_db`]'s
+/// `create_missing_column_families` (M2-62), and an extra one means a later schema version
+/// (M2-63). Used for both halves: the root database against [`COLUMN_FAMILIES`] and the log
+/// database against [`LOG_COLUMN_FAMILIES`].
+fn verify_column_families(
+    dir: &Path,
+    path: &Path,
+    expected: &[&str],
+) -> Result<(), StorageOpenError> {
+    let expected_names: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    let found = list_families(dir, path)?;
+    let has = |name: &str| found.iter().any(|f| f == name);
+    for name in expected {
+        if !has(name) {
+            return Err(StorageOpenError::MissingColumnFamily {
+                name: name.to_string(),
+                path: path.to_path_buf(),
+                expected: expected_names,
+            });
+        }
+    }
+    for name in &found {
+        // RocksDB always has `default`; it is unused here but cannot be dropped.
+        if name != "default" && !expected.contains(&name.as_str()) {
+            return Err(StorageOpenError::UnexpectedColumnFamily {
+                name: name.clone(),
+                path: path.to_path_buf(),
+                expected: expected_names,
+            });
+        }
+    }
+    Ok(())
 }
 
-/// Refuse a directory whose column-family set is neither the current one nor the v1 one.
-///
-/// A missing family would otherwise be auto-created over live data by
-/// [`open_db`]'s `create_missing_column_families`, and an extra one means a later schema
-/// version. The one tolerated shortfall is a complete v1 set, which is what every M2/M3
-/// directory looks like and is exactly what the migration exists to accept.
-fn verify_column_families(dir: &Path, path: &Path) -> Result<CfLayout, StorageOpenError> {
-    let expected: Vec<String> = COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect();
-    let found = DB::list_cf(&Options::default(), dir).map_err(|e| {
+/// `DB::list_cf`, with a lock failure named as one.
+fn list_families(dir: &Path, path: &Path) -> Result<Vec<String>, StorageOpenError> {
+    DB::list_cf(&Options::default(), dir).map_err(|e| {
         let detail = e.to_string();
         if detail.to_ascii_lowercase().contains("lock") {
             StorageOpenError::Locked {
@@ -1758,36 +1926,36 @@ fn verify_column_families(dir: &Path, path: &Path) -> Result<CfLayout, StorageOp
                 detail,
             }
         }
-    })?;
+    })
+}
 
-    let has = |name: &str| found.iter().any(|f| f == name);
-    for name in COLUMN_FAMILIES_V1 {
-        if !has(name) {
-            return Err(StorageOpenError::MissingColumnFamily {
-                name: name.to_string(),
-                path: path.to_path_buf(),
-                expected,
-            });
-        }
+/// Refuse a directory written before format 4, which keeps the Raft log in the root database.
+///
+/// **The one pre-split probe, with one call site at the top of `open_inner`.** Owner ruling of
+/// 2026-11-21 (ADR-0008): until the first real deploy, a format change refuses old folders with
+/// a typed error and no migration; from that deploy on, every format change migrates in place at
+/// startup. Keeping the recognition in one function is what lets that first migration replace
+/// exactly this and nothing else.
+///
+/// A v1, v2 or v3 build always created `raft_log` in the root database, so its presence there
+/// is the whole test, whatever the marker says. The marker is only reported. Everything here is
+/// read-only — `list_cf` and a read-only handle — so the refused directory is left as it was
+/// found and no `raft-log/` is created.
+fn refuse_pre_split_layout(dir: &Path, path: &Path) -> Result<(), StorageOpenError> {
+    if !list_families(dir, path)?.iter().any(|f| f == CF_RAFT_LOG) {
+        return Ok(());
     }
-    for name in &found {
-        // RocksDB always has `default`; it is unused here but cannot be dropped.
-        if name != "default" && !COLUMN_FAMILIES.contains(&name.as_str()) {
-            return Err(StorageOpenError::UnexpectedColumnFamily {
-                name: name.clone(),
-                path: path.to_path_buf(),
-                expected,
-            });
-        }
-    }
-
-    if COLUMN_FAMILIES.iter().all(|name| has(name)) {
-        Ok(CfLayout::Current)
-    } else if COLUMN_FAMILIES_V2.iter().all(|name| has(name)) {
-        Ok(CfLayout::LegacyV2)
-    } else {
-        Ok(CfLayout::LegacyV1)
-    }
+    // An unreadable marker still means a pre-split directory; it is reported as 0, "unknown".
+    let found = probe_format_version(dir, path).ok().flatten().unwrap_or(0);
+    tracing::error!(
+        path = %path.display(),
+        format_version = found,
+        "store_pre_split_layout"
+    );
+    Err(StorageOpenError::PreSplitLayout {
+        found,
+        path: path.to_path_buf(),
+    })
 }
 
 /// Read a directory's format marker without taking a write handle or creating anything.
@@ -1805,7 +1973,9 @@ fn probe_format_version(dir: &Path, path: &Path) -> Result<Option<u32>, StorageO
         path: path.to_path_buf(),
         detail,
     };
-    let db = DB::open_cf_for_read_only(&opts, dir, COLUMN_FAMILIES_V1, false)
+    // Only `state_meta`: read-only mode may open a subset of the families, and the marker is
+    // the one key this needs, in every layout any build has written.
+    let db = DB::open_cf_for_read_only(&opts, dir, [CF_STATE_META], false)
         .map_err(|e| backend(format!("cannot probe format version: {e}")))?;
     let handle = db
         .cf_handle(CF_STATE_META)
@@ -1895,7 +2065,7 @@ fn check_format_version(
                 _ => Err(unsupported(found)),
             }
         }
-        None if holds_persisted_state(db) => Err(unsupported(0)),
+        None if holds_persisted_state(db, path)? => Err(unsupported(0)),
         None => Ok(FormatAction::Stamp),
     }
 }
@@ -1956,8 +2126,12 @@ const BLOCKED_UNAPPLIED: &str = "unapplied";
 /// An empty log satisfies both, so every directory the old predicate admitted is still admitted.
 /// The scan is affordable because it only happens on the single open that finds a legacy marker;
 /// it reads, and never rewrites, so spec §17's bound on in-place rewrites is untouched.
-fn scan_log_for_upgrade(db: &DB, path: &Path) -> Result<LogUpgradeScan, StorageOpenError> {
-    let Some(handle) = db.cf_handle(CF_RAFT_LOG) else {
+fn scan_log_for_upgrade(
+    db: &DB,
+    log_db: &DB,
+    path: &Path,
+) -> Result<LogUpgradeScan, StorageOpenError> {
+    let Some(handle) = log_db.cf_handle(CF_RAFT_LOG) else {
         // A directory without the family at all has no history by definition. The
         // missing-family error belongs to `verify_column_families`, not here.
         return Ok(LogUpgradeScan::default());
@@ -1973,9 +2147,9 @@ fn scan_log_for_upgrade(db: &DB, path: &Path) -> Result<LogUpgradeScan, StorageO
     let applied_through = last_applied.map_or(0, |id| id.index);
 
     let mut scan = LogUpgradeScan::default();
-    for item in db.iterator_cf(handle, IteratorMode::Start) {
+    for item in log_db.iterator_cf(handle, IteratorMode::Start) {
         let (key, value) = item.map_err(|e| StorageOpenError::Backend {
-            path: path.to_path_buf(),
+            path: log_dir(path),
             detail: format!("cannot scan the raft log while checking for an upgrade: {e}"),
         })?;
         // An unreadable key is history this build cannot place, which is strictly worse than an
@@ -1996,25 +2170,6 @@ fn scan_log_for_upgrade(db: &DB, path: &Path) -> Result<LogUpgradeScan, StorageO
         }
     }
     Ok(scan)
-}
-
-/// Scan a legacy directory's log *without* a writable handle.
-///
-/// Same reason as [`probe_format_version`]: [`open_db`] would create the missing column family
-/// before anything could refuse, and a refused directory has to stay openable by the build that
-/// is going to drain it. The v1 family list is enough — `raft_log` is in every layout, and
-/// `last_applied` lives in `state_meta`, which is too.
-fn probe_log_for_upgrade(dir: &Path, path: &Path) -> Result<LogUpgradeScan, StorageOpenError> {
-    let mut opts = Options::default();
-    opts.create_if_missing(false);
-    opts.create_missing_column_families(false);
-    let db = DB::open_cf_for_read_only(&opts, dir, COLUMN_FAMILIES_V1, false).map_err(|e| {
-        StorageOpenError::Backend {
-            path: path.to_path_buf(),
-            detail: format!("cannot probe the raft log: {e}"),
-        }
-    })?;
-    scan_log_for_upgrade(&db, path)
 }
 
 /// Turn a blocking legacy log into the typed refusal, and log it once.
@@ -2042,37 +2197,89 @@ fn refuse_if_undrained(
     })
 }
 
-/// Whether the directory already holds values whose byte layout the format version selects.
+/// Whether the root database already holds values whose byte layout the format version selects.
 ///
-/// Only used to tell a brand-new directory (stamp the marker) from a pre-marker store (refuse
-/// it), so it probes the cheapest witnesses rather than scanning: the binding written on a
-/// first open, the vote written before any append, the first log key, and the applied pointer
-/// written with every state batch. Nothing persists without at least one of them.
-fn holds_persisted_state(db: &DB) -> bool {
-    let has = |cf: &str, key: &[u8]| {
-        db.cf_handle(cf)
-            .and_then(|h| db.get_cf(h, key).ok().flatten())
-            .is_some()
-    };
-    has(CF_STATE_META, KEY_IDENTITY)
-        || has(CF_STATE_META, KEY_LAST_APPLIED)
-        || has(CF_RAFT_META, KEY_VOTE)
-        || db
-            .cf_handle(CF_RAFT_LOG)
-            .is_some_and(|h| db.iterator_cf(h, IteratorMode::Start).next().is_some())
+/// Used to tell a brand-new directory (stamp the marker) from a pre-marker store (refuse it),
+/// and to tell a state machine that needs its log beside it from one that does not (I6). It
+/// probes the cheapest witnesses rather than scanning: the binding written on a first open, and
+/// the applied pointer written with every state batch. The log's witnesses are in the other
+/// database since format 4; see [`log_holds_raft_state`].
+fn holds_persisted_state(db: &DB, path: &Path) -> Result<bool, StorageOpenError> {
+    Ok(has_key(db, path, CF_STATE_META, KEY_IDENTITY)?
+        || has_key(db, path, CF_STATE_META, KEY_LAST_APPLIED)?)
 }
 
-/// Whether the `events` journal holds no entry at all. Absent family counts as empty: it is
-/// the v1 layout, which has no journal to resume from.
+fn has_key(db: &DB, path: &Path, family: &str, key: &[u8]) -> Result<bool, StorageOpenError> {
+    let backend = |detail| StorageOpenError::Backend {
+        path: path.to_path_buf(),
+        detail,
+    };
+    let cf = db
+        .cf_handle(family)
+        .ok_or_else(|| backend(format!("missing column family {family}")))?;
+    db.get_cf(cf, key)
+        .map(|value| value.is_some())
+        .map_err(|e| {
+            backend(format!(
+                "cannot read {family}/{}: {e}",
+                String::from_utf8_lossy(key)
+            ))
+        })
+}
+
+/// A log bound during first open can contain just its identity. Every other Raft witness
+/// requires the original root to be present and bound.
+fn log_holds_raft_state(db: &DB, path: &Path) -> Result<bool, StorageOpenError> {
+    for key in [KEY_VOTE, KEY_COMMITTED, KEY_LAST_PURGED] {
+        if has_key(db, path, CF_RAFT_META, key)? {
+            return Ok(true);
+        }
+    }
+    let cf = db
+        .cf_handle(CF_RAFT_LOG)
+        .ok_or_else(|| StorageOpenError::MissingColumnFamily {
+            name: CF_RAFT_LOG.to_string(),
+            path: path.to_path_buf(),
+            expected: LOG_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+        })?;
+    Ok(db
+        .iterator_cf(cf, IteratorMode::Start)
+        .next()
+        .transpose()
+        .map_err(|e| StorageOpenError::Backend {
+            path: path.to_path_buf(),
+            detail: format!("cannot read {CF_RAFT_LOG}: {e}"),
+        })?
+        .is_some())
+}
+
+fn require_root_for_live_log(
+    log: &DB,
+    root: &Path,
+    log_path: &Path,
+) -> Result<(), StorageOpenError> {
+    if log_holds_raft_state(log, log_path)? {
+        tracing::error!(path = %root.display(), missing = %root.display(), "missing_state_machine_store");
+        return Err(StorageOpenError::MissingLogStore {
+            path: root.to_path_buf(),
+            missing: root.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether the `events` journal holds no entry at all. An absent family counts as empty, though
+/// since format 4 `verify_column_families` refuses a root database without one before this runs.
 ///
 /// Safety of the empty-journal branch in `open_inner` rests on reachability, not on a check
 /// (critic-m6, M6-R22): the stamp it enables is a raise that `restore_compact_revision`
 /// unions by `max`, so it must never fire on a directory whose journal was merely trimmed.
 /// It cannot: retention trims through `Compact`, which is schema-gated and undecodable to a
 /// pinned build, so a marker-1 directory has never been trimmed; a trimmed current directory
-/// cannot be reopened pinned (the pre-open probe refuses marker 3 above ceiling 1, M6-98);
-/// and snapshot installs repopulate the journal. What remains empty is a true v1 directory,
-/// a crashed-mid-migration retry of one, or a store at `cluster_revision == 0`.
+/// cannot be reopened pinned (the pre-open probe refuses marker 4 above ceiling 1, M6-98);
+/// and snapshot installs repopulate the journal. What remains empty is a pinned store that never
+/// journalled anything, a crashed-mid-migration retry of one, or a store at
+/// `cluster_revision == 0`.
 fn journal_is_empty(db: &DB) -> bool {
     db.cf_handle(CF_EVENTS)
         .is_none_or(|h| db.iterator_cf(h, IteratorMode::Start).next().is_none())
@@ -2092,19 +2299,31 @@ fn read_meta<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn load_state(db: &DB, path: &Path, limits: Limits) -> Result<Loaded, StorageOpenError> {
+fn load_state(
+    db: &DB,
+    log_db: &DB,
+    path: &Path,
+    limits: Limits,
+) -> Result<Loaded, StorageOpenError> {
     let corrupt = |what: &str, detail: String| StorageOpenError::Corrupt {
         what: what.to_string(),
         path: path.to_path_buf(),
         detail,
     };
 
+    let log_corrupt = |what: &str, detail: String| StorageOpenError::Corrupt {
+        what: what.to_string(),
+        path: log_dir(path),
+        detail,
+    };
+
     let vote: Option<Vote<RaftNodeId>> =
-        read_meta(db, CF_RAFT_META, KEY_VOTE).map_err(|d| corrupt("raft_meta/vote", d))?;
-    let committed: Option<LogId<RaftNodeId>> = read_meta(db, CF_RAFT_META, KEY_COMMITTED)
-        .map_err(|d| corrupt("raft_meta/committed", d))?;
-    let last_purged: Option<LogId<RaftNodeId>> = read_meta(db, CF_RAFT_META, KEY_LAST_PURGED)
-        .map_err(|d| corrupt("raft_meta/last_purged", d))?;
+        read_meta(log_db, CF_RAFT_META, KEY_VOTE).map_err(|d| log_corrupt("raft_meta/vote", d))?;
+    let committed: Option<LogId<RaftNodeId>> = read_meta(log_db, CF_RAFT_META, KEY_COMMITTED)
+        .map_err(|d| log_corrupt("raft_meta/committed", d))?;
+    let last_purged: Option<LogId<RaftNodeId>> =
+        read_meta(log_db, CF_RAFT_META, KEY_LAST_PURGED)
+            .map_err(|d| log_corrupt("raft_meta/last_purged", d))?;
     let last_applied: Option<LogId<RaftNodeId>> = read_meta(db, CF_STATE_META, KEY_LAST_APPLIED)
         .map_err(|d| corrupt("state_meta/last_applied", d))?;
     let membership: StoredMembership<RaftNodeId, RaftNode> =
@@ -2129,20 +2348,21 @@ fn load_state(db: &DB, path: &Path, limits: Limits) -> Result<Loaded, StorageOpe
             .map_err(|d| corrupt("state_meta/install_in_progress", d))?;
 
     let log_cf =
-        db.cf_handle(CF_RAFT_LOG)
+        log_db
+            .cf_handle(CF_RAFT_LOG)
             .ok_or_else(|| StorageOpenError::MissingColumnFamily {
                 name: CF_RAFT_LOG.to_string(),
-                path: path.to_path_buf(),
-                expected: COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+                path: log_dir(path),
+                expected: LOG_COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
             })?;
-    let last_log_id = match db.iterator_cf(log_cf, IteratorMode::End).next() {
+    let last_log_id = match log_db.iterator_cf(log_cf, IteratorMode::End).next() {
         None => None,
-        Some(Err(e)) => return Err(corrupt("raft_log", e.to_string())),
+        Some(Err(e)) => return Err(log_corrupt("raft_log", e.to_string())),
         Some(Ok((key, value))) => {
             let index = decode_index(&key)
-                .ok_or_else(|| corrupt("raft_log key", format!("{} bytes", key.len())))?;
+                .ok_or_else(|| log_corrupt("raft_log key", format!("{} bytes", key.len())))?;
             let entry: Entry<TypeConfig> = postcard::from_bytes(&value)
-                .map_err(|e| corrupt(&format!("raft_log entry {index}"), e.to_string()))?;
+                .map_err(|e| log_corrupt(&format!("raft_log entry {index}"), e.to_string()))?;
             Some(entry.log_id)
         }
     };
@@ -2216,6 +2436,48 @@ fn load_state(db: &DB, path: &Path, limits: Limits) -> Result<Loaded, StorageOpe
     })
 }
 
+/// I1 at open: the applied index is never past both the durable log and the snapshot.
+///
+/// Since format 4 the log and the state machine sync through two WALs, so nothing on disk makes
+/// this hold by construction any more; on openraft 0.9.25 it holds because `RaftCore` awaits
+/// the log flush before an entry can be applied (ADR-0008 note of 2026-11-21). A directory that
+/// breaks it is refused as [`StorageOpenError::Corrupt`] rather than handed to OpenRaft, whose
+/// `get_initial_state` would silently purge the log up to `last_applied` and hide the fault.
+///
+/// The snapshot term is what makes the one legal "state ahead of log" shape pass: a crash
+/// between an install's final batch and its deferred log purge (see
+/// `execute_deferred_purge`), where the snapshot covers `last_applied`.
+fn check_applied_within_log(loaded: &Loaded, path: &Path) -> Result<(), StorageOpenError> {
+    let Some(applied) = loaded.last_applied.map(|l| l.index) else {
+        return Ok(());
+    };
+    let log_last = loaded.last_log_id.or(loaded.last_purged).map(|l| l.index);
+    let covered = loaded
+        .current_snapshot
+        .as_ref()
+        .and_then(|c| c.last_log_id)
+        .map(|l| l.index);
+    if log_last.max(covered).is_some_and(|index| applied <= index) {
+        return Ok(());
+    }
+    tracing::error!(
+        path = %path.display(),
+        last_applied = applied,
+        last_log_index = log_last,
+        snapshot_index = covered,
+        "store_applied_past_log"
+    );
+    Err(StorageOpenError::Corrupt {
+        what: "state_meta/last_applied".to_string(),
+        path: path.to_path_buf(),
+        detail: format!(
+            "applied index {applied} is past both the durable log (last index {log_last:?}) and \
+             the snapshot (covers {covered:?}); the state machine cannot be ahead of the log it \
+             was applied from (I1)"
+        ),
+    })
+}
+
 /// Rebuild [`JournalStats`] by scanning [`CF_EVENTS`].
 fn scan_journal_stats(db: &DB, path: &Path) -> Result<JournalStats, StorageOpenError> {
     let cf = db
@@ -2284,8 +2546,8 @@ impl RocksLog {
             return Ok(out);
         }
         let from = log_key(start);
-        let iter = shared.db.iterator_cf(
-            shared.cf(CF_RAFT_LOG),
+        let iter = shared.log_db.iterator_cf(
+            shared.log_cf(CF_RAFT_LOG),
             IteratorMode::From(&from, Direction::Forward),
         );
         for item in iter {
@@ -2380,8 +2642,8 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
                     )
                 })?;
                 let mut batch = WriteBatch::default();
-                batch.put_cf(s.cf(CF_RAFT_META), KEY_VOTE, encoded);
-                s.write(batch, true, ErrorSubject::Vote, ErrorVerb::Write)?;
+                batch.put_cf(s.log_cf(CF_RAFT_META), KEY_VOTE, encoded);
+                s.write_log(batch, true, ErrorSubject::Vote, ErrorVerb::Write)?;
                 s.log().vote = Some(vote);
                 s.fresh.store(false, Ordering::SeqCst);
                 s.after_boundary(
@@ -2431,11 +2693,11 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
                                 format!("cannot encode committed: {e}"),
                             )
                         })?;
-                        batch.put_cf(s.cf(CF_RAFT_META), KEY_COMMITTED, encoded);
+                        batch.put_cf(s.log_cf(CF_RAFT_META), KEY_COMMITTED, encoded);
                     }
-                    None => batch.delete_cf(s.cf(CF_RAFT_META), KEY_COMMITTED),
+                    None => batch.delete_cf(s.log_cf(CF_RAFT_META), KEY_COMMITTED),
                 }
-                s.write(batch, false, ErrorSubject::Store, ErrorVerb::Write)?;
+                s.write_log(batch, false, ErrorSubject::Store, ErrorVerb::Write)?;
                 s.log().committed = committed;
                 tracing::debug!(
                     log_index = committed.map(|l| l.index),
@@ -2508,7 +2770,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
                             format!("cannot encode log entry {index}: {e}"),
                         )
                     })?;
-                    batch.put_cf(s.cf(CF_RAFT_LOG), log_key(index), encoded);
+                    batch.put_cf(s.log_cf(CF_RAFT_LOG), log_key(index), encoded);
                     expected = Some(index + 1);
                     appended_last = Some(entry.log_id);
                 }
@@ -2516,7 +2778,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
                 // Write without sync so `AfterLogAppend`, `BeforeLogFlush` and `AfterLogFlush`
                 // are three distinct instants (TA-13.1). The batch is still atomic, and the
                 // entries are readable on return (§9.3.3).
-                s.write(batch, false, ErrorSubject::Logs, ErrorVerb::Write)?;
+                s.write_log(batch, false, ErrorSubject::Logs, ErrorVerb::Write)?;
                 if let Some(log_id) = appended_last {
                     s.log().last_log_id = Some(log_id);
                 }
@@ -2575,13 +2837,13 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
                     ErrorSubject::Logs,
                     ErrorVerb::Delete,
                 )?;
-                let cf = s.cf(CF_RAFT_LOG);
+                let cf = s.log_cf(CF_RAFT_LOG);
                 let mut batch = WriteBatch::default();
                 // `delete_range_cf` is end-exclusive, so the highest possible key needs its own
                 // point delete.
                 batch.delete_range_cf(cf, log_key(log_id.index), log_key(u64::MAX));
                 batch.delete_cf(cf, log_key(u64::MAX));
-                s.write(batch, true, ErrorSubject::Logs, ErrorVerb::Delete)?;
+                s.write_log(batch, true, ErrorSubject::Logs, ErrorVerb::Delete)?;
                 let new_last = last_log_id_on_disk(s)?;
                 s.log().last_log_id = new_last;
                 s.after_boundary(
@@ -2620,7 +2882,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
     ///    are reconstructible from durable state machine or from the snapshot file. Purge.
     /// 2. **Deferred** — not covered, but a snapshot transfer is genuinely in flight
     ///    (an open receive slot or the install marker). Delete nothing, persist nothing, keep the
-    ///    request, and let the install execute it in the same synced batch that makes it legal.
+    ///    request, and execute it in a separate synced log batch after the install is durable.
     /// 3. **Refused** — not covered and nothing in flight. This is the logic error the original
     ///    guard was written for, and it still gets a `StorageError` (test plan M5-24). The
     ///    deferral is deliberately *not* the fallback: a mistake must surface as an error, not
@@ -2688,7 +2950,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
 
                 let mut batch = WriteBatch::default();
                 purge_into(s, &mut batch, log_id)?;
-                s.write(batch, true, ErrorSubject::Logs, ErrorVerb::Delete)?;
+                s.write_log(batch, true, ErrorSubject::Logs, ErrorVerb::Delete)?;
                 {
                     let mut log = s.log();
                     log.last_purged = Some(log_id);
@@ -2713,7 +2975,7 @@ impl RaftLogStorage<TypeConfig> for RocksLog {
 /// Add "delete the log up to `log_id`, and say so" to `batch`.
 ///
 /// Shared by [`RocksLog::purge`] and by the install path, which executes a deferred purge in
-/// its own final batch: the deletion and the `last_purged` that explains it must land together
+/// a synced log batch after its final state batch: the deletion and the `last_purged` that explains it must land together
 /// or a crash between them leaves a log whose missing prefix nothing accounts for.
 #[allow(clippy::result_large_err)]
 fn purge_into(
@@ -2721,9 +2983,9 @@ fn purge_into(
     batch: &mut WriteBatch,
     log_id: LogId<RaftNodeId>,
 ) -> Result<(), StorageError<RaftNodeId>> {
-    batch.delete_range_cf(s.cf(CF_RAFT_LOG), log_key(0), log_key(log_id.index + 1));
+    batch.delete_range_cf(s.log_cf(CF_RAFT_LOG), log_key(0), log_key(log_id.index + 1));
     batch.put_cf(
-        s.cf(CF_RAFT_META),
+        s.log_cf(CF_RAFT_META),
         KEY_LAST_PURGED,
         postcard::to_stdvec(&log_id).map_err(|e| {
             io_error(
@@ -2742,8 +3004,8 @@ fn last_log_id_on_disk(
     s: &RocksShared,
 ) -> Result<Option<LogId<RaftNodeId>>, StorageError<RaftNodeId>> {
     match s
-        .db
-        .iterator_cf(s.cf(CF_RAFT_LOG), IteratorMode::End)
+        .log_db
+        .iterator_cf(s.log_cf(CF_RAFT_LOG), IteratorMode::End)
         .next()
     {
         None => Ok(None),
@@ -3237,8 +3499,8 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
     /// Phase one makes the file durable under its final name and writes an
     /// `install_in_progress` marker in its own synced batch. Phase two clears the data column
     /// families, streams the records in, and commits one final synced batch carrying the new
-    /// applied state, the new `current_snapshot`, the **deletion** of the marker, and any purge
-    /// that was deferred waiting for exactly this moment. Between the two phases the state
+    /// applied state, the new `current_snapshot` and the **deletion** of the marker. A deferred
+    /// purge then runs as its own synced log write. Between the two phases the state
     /// machine is a mixture of the old and new states — which is why a marker found at open
     /// means "redo", not "continue".
     async fn install_snapshot(
@@ -4124,7 +4386,6 @@ fn apply_snapshot_records(
     data_dir: &Path,
     snap_file: &Path,
     stored: &StoredSnapshot,
-    pending_purge: Option<LogId<RaftNodeId>>,
     sync: bool,
     mut hook: impl FnMut(InstallPhase) -> Result<(), String>,
 ) -> Result<InstalledState, SnapshotFileError> {
@@ -4314,17 +4575,10 @@ fn apply_snapshot_records(
     // The marker and everything it was protecting disappear together. A crash before this
     // write redoes the install; a crash after it has nothing left to redo.
     last.delete_cf(meta_cf, KEY_INSTALL_IN_PROGRESS);
-    if let Some(log_id) = pending_purge {
-        // Ruling M5-R11: the deferred purge executes *here*, in the same synced batch that
-        // makes `current_snapshot` durable, and nowhere else. Before this batch there is no
-        // durable justification for it; after it there is, atomically.
-        last.delete_range_cf(cf(CF_RAFT_LOG)?, log_key(0), log_key(log_id.index + 1));
-        last.put_cf(
-            cf(CF_RAFT_META)?,
-            KEY_LAST_PURGED,
-            encode("last_purged", postcard::to_stdvec(&log_id))?,
-        );
-    }
+    // A deferred purge (ruling M5-R11) is no longer in this batch: the log lives in its own
+    // database since format 4 (#186), and one `WriteBatch` cannot span two. `install_received`
+    // runs it as a separate synced log write *after* this batch returns, which keeps M5-R11's
+    // rule that the purge is never durable before `current_snapshot` is.
     let mut final_opts = WriteOptions::default();
     final_opts.set_sync(sync);
     db.write_opt(last, &final_opts)
@@ -4477,7 +4731,6 @@ fn install_received(
         &s.path,
         &final_path,
         &stored,
-        pending,
         s.sync_writes,
         |phase| {
             let boundary = match phase {
@@ -4530,12 +4783,7 @@ fn install_received(
         s.mirror_applied(&sm);
     }
     if let Some(log_id) = pending {
-        let mut log = s.log();
-        log.last_purged = Some(log_id);
-        log.last_log_id = log.last_log_id.filter(|l| l.index > log_id.index);
-        drop(log);
-        s.purges_performed.fetch_add(1, Ordering::SeqCst);
-        tracing::info!(log_index = log_id.index, "purge_deferred_executed");
+        execute_deferred_purge(s, log_id)?;
     }
     s.fresh.store(false, Ordering::SeqCst);
     s.snapshot_installs.fetch_add(1, Ordering::SeqCst);
@@ -4571,6 +4819,40 @@ fn install_received(
     Ok(())
 }
 
+/// Run the purge an install deferred, once the install's final batch is durable (#186).
+///
+/// The order is the one ADR-0008's two-WAL table gives: the state-machine final batch (which
+/// made `current_snapshot` durable) has already returned, and only then is the log prefix
+/// deleted, in its own synced write on the log database with `last_purged` beside it
+/// ([`purge_into`]). It crosses `BeforePurge` / `AfterPurge` like any purge, so a crash between
+/// the two writes is injectable. That crash leaves the state machine ahead of the log, which is
+/// legal: the snapshot covers `last_applied` (I1), and at the next start OpenRaft purges to
+/// `last_applied`, which `RocksLog::purge` accepts as covered.
+#[allow(clippy::result_large_err)]
+fn execute_deferred_purge(
+    s: &RocksShared,
+    log_id: LogId<RaftNodeId>,
+) -> Result<(), StorageError<RaftNodeId>> {
+    s.boundary(Boundary::BeforePurge, ErrorSubject::Logs, ErrorVerb::Delete)?;
+    let mut batch = WriteBatch::default();
+    purge_into(s, &mut batch, log_id)?;
+    s.write_log(batch, true, ErrorSubject::Logs, ErrorVerb::Delete)?;
+    {
+        let mut log = s.log();
+        log.last_purged = Some(log_id);
+        log.last_log_id = log.last_log_id.filter(|l| l.index > log_id.index);
+    }
+    s.purges_performed.fetch_add(1, Ordering::SeqCst);
+    tracing::info!(log_index = log_id.index, "purge_deferred_executed");
+    s.after_boundary(
+        Boundary::AfterPurge,
+        ErrorSubject::Logs,
+        ErrorVerb::Delete,
+        Some(log_id.index),
+        s.sync_writes,
+    )
+}
+
 /// Finish an install that a crash interrupted, before the store is handed to anyone.
 ///
 /// The marker means the data column families hold a mixture of the old state and a partially
@@ -4596,7 +4878,7 @@ fn redo_install(
         detail,
     };
     validate_snapshot_file(&file, identity, command_schema).map_err(|e| corrupt(e.to_string()))?;
-    apply_snapshot_records(db, path, &file, marker, None, true, |_| Ok(()))
+    apply_snapshot_records(db, path, &file, marker, true, |_| Ok(()))
         .map_err(|e| corrupt(e.to_string()))?;
     tracing::warn!(
         snapshot_id = %marker.snapshot_id,

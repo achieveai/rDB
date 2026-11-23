@@ -80,7 +80,8 @@ pub struct SchemaTriple {
 
 /// What this build is.
 ///
-/// `format_version` is 3 because M5 added the dedup column family; `command_schema` is 2
+/// `format_version` is 4 because #186 moved the Raft log into its own database under
+/// `<data_dir>/raft-log/` (M5's dedup column family made it 3); `command_schema` is 2
 /// because M4/M5 added `Compact`, `RetireNode` and the dedup group to the envelope.
 ///
 /// `proto_rev` stays 1 through M6, deliberately (finding F-017). M6 did grow the gRPC
@@ -96,7 +97,7 @@ pub struct SchemaTriple {
 /// (module docs). It is still carried on the peer wire and printed by
 /// [`Display`](std::fmt::Display).
 pub const CURRENT_SCHEMA: SchemaTriple = SchemaTriple {
-    format_version: 3,
+    format_version: 4,
     command_schema: COMMAND_SCHEMA_V2,
     proto_rev: 1,
 };

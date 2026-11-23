@@ -268,8 +268,9 @@ the node through `begin_receiving_snapshot` *before* `install_full_snapshot` is 
 slot is always open at the moment the follower purge is issued.
 
 `pending_purge` is in-memory only. It is dropped, not executed, if the install aborts or the
-process restarts, and it is executed only inside install's final synced batch, after
-`current_snapshot` is durable. The next `purge` call re-evaluates from scratch. Rows:
+process restarts. With format 4, install first commits the final state batch containing
+`current_snapshot`, then executes the pending purge in a separate synced log batch (ADR-0008).
+The next `purge` call re-evaluates from scratch. Rows:
 `m5_24a_purge_during_install_is_deferred_then_executed`,
 `m5_24b_aborted_install_drops_the_pending_purge`,
 `m5_24c_restart_mid_defer_reports_the_lower_last_purged`, and

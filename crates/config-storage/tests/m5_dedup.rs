@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use config_core::{
-    ClusterId, ClusterIdentity, Command, CommandResponse, DedupKey, DedupLimits, KvState, Limits,
+    ClusterId, ClusterIdentity, Command, CommandResponse, DedupKey, DedupLimits, Limits,
     MutationOutcome, NodeId, RecoveryEpoch,
 };
 use config_log::retcd_test;
@@ -22,9 +22,12 @@ use config_storage::{
     RocksOptions, RocksStore, SnapshotReader, StorageOpenError, TypeConfig, CF_DEDUP,
     COLUMN_FAMILIES,
 };
-use openraft::storage::{RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
+use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
 use tracing::Span;
+
+#[path = "support/pre_split.rs"]
+mod pre_split;
 
 const ALICE: [u8; 32] = [0x11; 32];
 const CLIENT: [u8; 16] = [0xab; 16];
@@ -134,6 +137,21 @@ fn raw_dedup_count(dir: &Path) -> usize {
     n
 }
 
+/// Append `entries` to the log, then apply them: the order real Raft uses. The store's open
+/// refuses a state machine applied past its durable log (I1, ADR-0008 note of 2026-11-21), so a
+/// row that reopens must not apply entries it never appended.
+///
+/// `StorageError` is OpenRaft's own error type, returned as the store returns it.
+#[allow(clippy::result_large_err)]
+async fn append_apply(
+    s: &RocksStore,
+    entries: Vec<Entry<TypeConfig>>,
+) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::R>, openraft::StorageError<RaftNodeId>> {
+    openraft::storage::RaftLogStorageExt::blocking_append(&mut s.log_store(), entries.clone())
+        .await?;
+    openraft::storage::RaftStateMachine::apply(&mut s.state_machine(), entries).await
+}
+
 /// M5-102 (durability half): the dedup record is written in the **same** synced batch as the
 /// KV change, so the two can never be observed apart.
 ///
@@ -220,7 +238,7 @@ async fn m5_102_dedup_record_survives_with_its_mutation_at_after_state_batch() {
                 seen: AtomicU64::new(0),
             }),
         );
-        let result = s.state_machine().apply(vec![put(1, "/a", "1", 7)]).await;
+        let result = append_apply(&s, vec![put(1, "/a", "1", 7)]).await;
         assert!(result.is_err(), "the crash lands after the synced write");
         drop(s);
     }
@@ -231,11 +249,7 @@ async fn m5_102_dedup_record_survives_with_its_mutation_at_after_state_batch() {
     assert_eq!(s.reader().cluster_revision(), 1);
     assert_eq!(s.reader().dedup_stats().records, 1);
 
-    let responses = s
-        .state_machine()
-        .apply(vec![put(2, "/a", "1", 7)])
-        .await
-        .unwrap();
+    let responses = append_apply(&s, vec![put(2, "/a", "1", 7)]).await.unwrap();
     let CommandResponse::Mutation {
         response,
         dedup_hit,
@@ -260,14 +274,16 @@ async fn m5_dedup_index_and_retired_set_survive_a_restart() {
     {
         let s = open_plain(tmp.path());
         s.log_store().save_vote(&Vote::new(1, 1)).await.unwrap();
-        s.state_machine()
-            .apply(vec![
+        append_apply(
+            &s,
+            vec![
                 put(1, "/a", "1", 1),
                 put(2, "/b", "2", 2),
                 entry(3, Command::RetireNode { node_id: NodeId(3) }),
-            ])
-            .await
-            .unwrap();
+            ],
+        )
+        .await
+        .unwrap();
         drop(s);
     }
 
@@ -288,11 +304,7 @@ async fn m5_dedup_index_and_retired_set_survive_a_restart() {
     drop(reader);
 
     // The rebuilt index is the *same* index: a resubmission is still a hit after the restart.
-    let responses = s
-        .state_machine()
-        .apply(vec![put(4, "/a", "1", 1)])
-        .await
-        .unwrap();
+    let responses = append_apply(&s, vec![put(4, "/a", "1", 1)]).await.unwrap();
     assert!(matches!(
         responses[0],
         CommandResponse::Mutation {
@@ -310,24 +322,28 @@ async fn m5_100_compact_trims_the_dedup_family() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let s = open_plain(tmp.path());
-        s.state_machine()
-            .apply(vec![
+        append_apply(
+            &s,
+            vec![
                 put(1, "/a", "1", 1),
                 put(2, "/b", "2", 2),
                 put(3, "/c", "3", 3),
-            ])
-            .await
-            .unwrap();
-        s.state_machine()
-            .apply(vec![entry(
+            ],
+        )
+        .await
+        .unwrap();
+        append_apply(
+            &s,
+            vec![entry(
                 4,
                 Command::Compact {
                     up_to_revision: 2,
                     dedup_trim_below: Some(3),
                 },
-            )])
-            .await
-            .unwrap();
+            )],
+        )
+        .await
+        .unwrap();
         assert_eq!(s.reader().dedup_stats().records, 1);
         drop(s);
     }
@@ -381,72 +397,57 @@ async fn m5_103_dedup_family_is_snapshot_data() {
     drop(s);
 }
 
-/// ADR-0021 v2 -> v3: an M4 directory gains the `dedup` family on open and keeps its data. The
-/// row is built by demoting a real current directory rather than hand-assembling one, so what
-/// it migrates is what an M4 build actually wrote.
+/// ADR-0021 v2 -> v3, superseded: an M4 (v2) directory is refused as `PreSplitLayout`.
 ///
-/// Note what "an M4 directory" means here, because the row's first version read as if it meant
-/// more: the directory's **log is empty**. `apply` writes state without appending, so nothing
-/// ever reached `raft_log`. That is not incidental coverage, it is the only case migration
-/// supports — ADR-0021 note 4 (ruling M5-R19) refuses an undrained legacy log outright, since
-/// the log payload is a positional `postcard` encoding of a `Command` this build has widened.
-/// The refusal is the row below; this row is the drained half of the same contract.
+/// This row migrated an M4 directory forward and gave it the `dedup` family. Format 4 (#186)
+/// moved the Raft log out of the root database into `raft-log/`, and the owner ruled on
+/// 2026-11-21 that until the first real deploy a format change refuses old folders with a typed
+/// error and no migration (ADR-0008). The directory is built by folding a real current store,
+/// so what is refused is what an M4 build actually wrote, and it must be left as it was found.
 #[retcd_test]
-async fn m5_v2_directory_migrates_forward_and_gains_the_dedup_family() {
+async fn m5_v2_directory_is_refused_as_pre_split() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let s = open_plain(tmp.path());
-        s.state_machine()
-            .apply(vec![put(1, "/a", "1", 1)])
+        let entries = vec![put(1, "/a", "1", 1)];
+        s.log_store()
+            .blocking_append(entries.clone())
             .await
             .unwrap();
+        s.state_machine().apply(entries).await.unwrap();
         drop(s);
     }
-    {
-        let mut db = rocksdb::DB::open_cf(
-            &rocksdb::Options::default(),
-            tmp.path(),
-            COLUMN_FAMILIES.iter().copied(),
-        )
-        .expect("reopen raw to demote");
-        {
-            let cf = db
-                .cf_handle(config_storage::CF_STATE_META)
-                .expect("state_meta cf");
-            db.put_cf(cf, b"format_version", 2u32.to_le_bytes())
-                .expect("restamp v2");
-            db.delete_cf(cf, b"retired_nodes").expect("drop the v3 key");
-        }
-        db.drop_cf(CF_DEDUP).expect("drop the dedup family");
-    }
+    pre_split::fold_to_pre_split(tmp.path(), 2);
     assert!(
         !rocksdb::DB::list_cf(&rocksdb::Options::default(), tmp.path())
             .expect("list")
             .iter()
             .any(|c| c == CF_DEDUP)
     );
+    let before = pre_split::snapshot_files(tmp.path());
 
-    let s = open_plain(tmp.path());
-    let reader = s.reader();
-    let mut records = 0;
-    reader.with_state(&mut |kv: &KvState| records = kv.len());
-    assert_eq!(records, 1, "the record survives the migration");
-    assert_eq!(reader.cluster_revision(), 1);
+    match RocksStore::open_with(
+        tmp.path(),
+        identity(),
+        dedup_limits(),
+        Arc::new(NoFaults),
+        Span::none(),
+        RocksOptions::DEFAULT,
+        Arc::new(NoopSink),
+    ) {
+        Err(StorageOpenError::PreSplitLayout { found, ref path }) => {
+            assert_eq!(found, 2, "the refusal names the marker it found");
+            assert_eq!(path.as_path(), tmp.path());
+        }
+        Err(other) => panic!("expected PreSplitLayout, got {other:?}"),
+        Ok(_) => panic!("a v2 directory must not open"),
+    }
     assert_eq!(
-        reader.dedup_stats().records,
-        0,
-        "and starts an empty window"
+        pre_split::snapshot_files(tmp.path()),
+        before,
+        "the refused directory is left byte for byte as it was found, dedup family still absent"
     );
-    drop(reader);
-    drop(s);
-
-    assert!(
-        rocksdb::DB::list_cf(&rocksdb::Options::default(), tmp.path())
-            .expect("list")
-            .iter()
-            .any(|c| c == CF_DEDUP)
-    );
-    assert_eq!(raw_dedup_count(tmp.path()), 0);
+    assert!(!config_storage::log_dir(tmp.path()).exists());
 }
 
 /// A second store in the same cluster, so a snapshot built by one installs into the other.
@@ -619,8 +620,6 @@ async fn m5_103_install_restores_the_dedup_index_and_retired_set() {
 /// this one, which is exactly why both are here.
 #[retcd_test]
 async fn m5_133_retired_set_converges_through_snapshot_install() {
-    use openraft::storage::RaftLogStorageExt;
-
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
 
@@ -760,45 +759,33 @@ struct M4Entry {
     payload: M4Payload,
 }
 
-/// The column families a v2 (M4) directory has, for the raw reopens this row does.
-const V2_FAMILIES: [&str; 6] = [
-    "default",
-    "raft_log",
-    "raft_meta",
-    "kv",
-    "state_meta",
-    "events",
-];
-
-/// M5-127 (finding C5B-03, ruling M5-R19): a legacy directory whose Raft log was never drained
-/// is refused **by name**, and the refusal leaves the directory exactly as it was found.
+/// M5-127 (finding C5B-03, ruling M5-R19), superseded by format 4: a legacy directory whose Raft
+/// log was never drained is refused as `PreSplitLayout`, and left exactly as it was found.
 ///
-/// The row above proves the state half of ADR-0021 migrates. This row is about the half that
-/// cannot: a log entry is `postcard::to_stdvec(&Entry<TypeConfig>)`, and `postcard` is
-/// positional with no per-field tag and no payload version. M5 widened `Command` — a dedup
-/// stamp on `Put`/`Delete`, a trim watermark on `Compact`, `RetireNode` added — so M4's bytes
-/// are not an older dialect of something this build reads; they are a different grammar. The
-/// first assertion makes that concrete rather than assuming it.
-///
-/// So the refusal is the feature. It happens before the open batch, which matters more than it
-/// looks: the operator's fix is to go *back* to the old build and drain the log there, and that
-/// is only possible while the directory still says v2.
+/// The row used to prove the drained-log refusal on a v2 directory. Since format 4 every v1-v3
+/// directory is refused before its log is read at all (owner ruling 2026-11-21, ADR-0008), and
+/// the drained-log check is live only for the split directory a `--compat-schema 1` node writes,
+/// which `m6_compat_open`'s M6-R20 rows cover. What still matters here is the premise: M4's log
+/// bytes are a different grammar from this build's, so the refusal must not read them. Draining
+/// the log first does not change the answer, because the layout is the reason, not the log.
 #[retcd_test]
 async fn m5_127_v2_directory_with_an_undrained_log_is_refused_by_name() {
     let tmp = tempfile::tempdir().unwrap();
     {
         let s = open_plain(tmp.path());
-        s.state_machine()
-            .apply(vec![put(1, "/a", "1", 1)])
+        let entries = vec![put(1, "/a", "1", 1)];
+        s.log_store()
+            .blocking_append(entries.clone())
             .await
             .unwrap();
+        s.state_machine().apply(entries).await.unwrap();
         drop(s);
     }
 
     // One genuine M4 log entry: an unconditional `Put` with no dedup stamp, which is exactly
     // what an M4 leader appended.
     let m4_bytes = postcard::to_stdvec(&M4Entry {
-        log_id: log_id(1, 1),
+        log_id: log_id(1, 2),
         payload: M4Payload::Normal(M4Command::Put {
             key: Bytes::from_static(b"/m4"),
             value: Bytes::from_static(b"written-by-m4"),
@@ -807,8 +794,7 @@ async fn m5_127_v2_directory_with_an_undrained_log_is_refused_by_name() {
     })
     .expect("the M4 entry encodes");
 
-    // The premise of the ruling, asserted rather than assumed: this build cannot read those
-    // bytes back. A *silent success* would be the dangerous outcome, so it is checked here.
+    // The premise, asserted rather than assumed: this build cannot read those bytes back.
     if let Ok(entry) = postcard::from_bytes::<Entry<TypeConfig>>(&m4_bytes) {
         panic!(
             "an M4 log entry decoded under the M5 `Command` layout, which means an in-place \
@@ -817,101 +803,54 @@ async fn m5_127_v2_directory_with_an_undrained_log_is_refused_by_name() {
         );
     }
 
-    // Demote the directory to what an M4 build left behind, log included.
-    {
-        let mut db = rocksdb::DB::open_cf(
-            &rocksdb::Options::default(),
+    // Demote the directory to what an M4 build left behind, the undrained entry included.
+    pre_split::fold_with(tmp.path(), 2, |db| {
+        let log = db.cf_handle("raft_log").expect("raft_log cf");
+        db.put_cf(log, 2u64.to_be_bytes(), &m4_bytes)
+            .expect("seed the undrained entry");
+    });
+    let open = || {
+        RocksStore::open_with(
             tmp.path(),
-            COLUMN_FAMILIES.iter().copied(),
+            identity(),
+            dedup_limits(),
+            Arc::new(NoFaults),
+            Span::none(),
+            RocksOptions::DEFAULT,
+            Arc::new(NoopSink),
         )
-        .expect("reopen raw to demote");
-        {
-            let meta = db
-                .cf_handle(config_storage::CF_STATE_META)
-                .expect("state_meta cf");
-            db.put_cf(meta, b"format_version", 2u32.to_le_bytes())
-                .expect("restamp v2");
-            db.delete_cf(meta, b"retired_nodes")
-                .expect("drop the v3 key");
-            let log = db.cf_handle("raft_log").expect("raft_log cf");
-            db.put_cf(log, 1u64.to_be_bytes(), &m4_bytes)
-                .expect("seed the undrained entry");
-        }
-        db.drop_cf(CF_DEDUP).expect("drop the dedup family");
-    }
-
-    let refused = RocksStore::open_with(
-        tmp.path(),
-        identity(),
-        dedup_limits(),
-        Arc::new(NoFaults),
-        Span::none(),
-        RocksOptions::DEFAULT,
-        Arc::new(NoopSink),
-    );
-    match refused {
-        Err(StorageOpenError::UpgradeRequiresDrainedLog {
-            format,
-            log_entries,
-            ref path,
-        }) => {
-            assert_eq!(format, 2, "the refusal names the version it found");
-            assert_eq!(log_entries, 1, "and how much history is in the way");
+    };
+    let before = pre_split::snapshot_files(tmp.path());
+    match open() {
+        Err(StorageOpenError::PreSplitLayout { found, ref path }) => {
+            assert_eq!(found, 2, "the refusal names the version it found");
             assert_eq!(path.as_path(), tmp.path());
-            // The operator has to be able to act on this without reading the source.
-            let message = refused.as_ref().unwrap_err().to_string();
-            for needle in ["snapshot", "purge", "drained"] {
-                assert!(
-                    message.contains(needle),
-                    "the refusal must name the fix; {needle:?} missing from {message:?}"
-                );
-            }
         }
-        Err(other) => panic!("expected a typed drained-log refusal, got {other:?}"),
+        Err(other) => panic!("expected PreSplitLayout, got {other:?}"),
         Ok(_) => panic!("a v2 directory with an undrained log must not open"),
     }
-
-    // Nothing was migrated on the way to that error: the marker still reads v2 and the dedup
-    // family is still absent, so the previous build can still open this directory and drain it.
-    {
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), tmp.path(), V2_FAMILIES)
-            .expect("the refused directory still opens as v2");
-        let meta = db
-            .cf_handle(config_storage::CF_STATE_META)
-            .expect("state_meta cf");
-        assert_eq!(
-            db.get_cf(meta, b"format_version").expect("read marker"),
-            Some(2u32.to_le_bytes().to_vec()),
-            "a refused open must not have stamped the new format version"
-        );
-    }
-    assert!(
-        !rocksdb::DB::list_cf(&rocksdb::Options::default(), tmp.path())
-            .expect("list")
-            .iter()
-            .any(|c| c == CF_DEDUP),
-        "a refused open must not have created the dedup family either"
+    assert_eq!(
+        pre_split::snapshot_files(tmp.path()),
+        before,
+        "nothing was migrated on the way to that error, and the M4 entry was not rewritten"
     );
 
-    // And the documented fix works: drain the log on the old build, then upgrade.
+    // Draining the log on the old build no longer opens the way forward.
     {
-        let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), tmp.path(), V2_FAMILIES)
-            .expect("reopen raw to drain");
+        let db = rocksdb::DB::open_cf(
+            &rocksdb::Options::default(),
+            tmp.path(),
+            ["kv", "state_meta", "events", "raft_log", "raft_meta"],
+        )
+        .expect("reopen raw to drain");
         let log = db.cf_handle("raft_log").expect("raft_log cf");
-        db.delete_cf(log, 1u64.to_be_bytes()).expect("drain");
+        db.delete_cf(log, 2u64.to_be_bytes()).expect("drain");
     }
-    let s = open_plain(tmp.path());
-    let reader = s.reader();
-    let mut records = 0;
-    reader.with_state(&mut |kv: &KvState| records = kv.len());
-    assert_eq!(records, 1, "the drained directory migrates as usual");
-    drop(reader);
-    drop(s);
     assert!(
-        rocksdb::DB::list_cf(&rocksdb::Options::default(), tmp.path())
-            .expect("list")
-            .iter()
-            .any(|c| c == CF_DEDUP),
-        "and gains the dedup family, exactly as the drained-from-the-start row does"
+        matches!(
+            open(),
+            Err(StorageOpenError::PreSplitLayout { found: 2, .. })
+        ),
+        "the layout is the reason for the refusal, not the log"
     );
 }

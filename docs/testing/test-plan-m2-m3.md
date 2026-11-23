@@ -75,6 +75,19 @@ Consequences for `RocksStore`:
 4. The hook is consulted on **every** crossing (so an injector can fire on the *k*-th only) and
    the default injector is a zero-cost no-op.
 
+**Update (2026-11-21, #186 part 2, format 4).** The log now has its own database under
+`<data_dir>/raft-log/` (ADR-0008, note of 2026-11-21). The boundaries and their order are
+unchanged, but each one now sits on a named database:
+
+- The vote and log boundaries (`BeforeVoteSync` to `AfterLogFlush`) bracket writes to the
+  **log database**. The explicit sync in item 1 is `flush_wal(true)` on the log database.
+- The state boundaries (`BeforeStateBatch`, `AfterStateBatch`) bracket the one batch to the
+  **root database**.
+
+So item 1's "synced before the callback" is now a statement about the log database's write-ahead
+log, and an apply's fsync no longer flushes the log too. The order across the two is the
+ordering table in that ADR note.
+
 ### TA-14 — `Crash` poisons the store; it does not unwind through a flushing `Drop`
 
 `FaultAction::Crash` must:
@@ -905,7 +918,7 @@ owning ADR before the blocked row is written.
 | ID | Question | Blocks | Owner ADR | Recommendation (default) |
 |---|---|---|---|---|
 | OQ-11 | §21 M2 says `durability=Persistent` is reported "only after all M2 gates pass" — that is self-referential. What mechanism enforces it? | M2-49, M2-51, E2E-02 | ADR-0016 | `RocksStore` reports `Persistent` whenever it is opened with full sync and verified identity, and `PersistentUnverified` otherwise (sync disabled, or identity check skipped). The "only after the gates pass" clause is enforced by CI: `tests/m2_*.rs` is a required gate, so no artifact claiming `Persistent` can ship without it. Do **not** invent a build-time `m2_verified` feature — a cfg-gated capability is a different code path from the one under test. |
-| OQ-12 | ADR-0008 lists six fault boundaries; §20 requires log-flush injection too. Extend to eight? | M2-19..M2-29 | ADR-0008 | Yes — extend to eight and make `append` write-then-explicit-sync (TA-13). Keeping six means §20's "log flush" gate has no test. |
+| OQ-12 | ADR-0008 lists six fault boundaries; §20 requires log-flush injection too. Extend to eight? | M2-19..M2-29 | ADR-0008 | Yes — extend to eight and make `append` write-then-explicit-sync (TA-13). Keeping six means §20's "log flush" gate has no test. **2026-11-21 (#186, format 4):** still eight, unchanged. The log boundaries now sit on the separate log database under `raft-log/`, and the state boundaries on the root (TA-13 update). |
 | OQ-13 | Opening a data dir with an **extra** column family (e.g. a future `events`) — reject, ignore, or migrate? | M2-63 | ADR-0008 / §17 | Reject with a typed error naming the CF. An unexpected CF means the directory belongs to a different schema version; §17 requires explicit migrations, and silently ignoring it risks a later downgrade writing an inconsistent pair of CFs. |
 | OQ-14 | `apply` batching: does the state machine ever receive more than one entry per `WriteBatch`, and is that one sync or many? | M2-53, M2-16 | ADR-0008 | One `WriteBatch` per `apply()` call covering **all** entries in that call, one sync. Record the observed sync count for a 10-put workload as a golden constant in M2-53 so a change is a test failure, not a silent durability regression. |
 | OQ-15 | Is there a supported no-sync mode at all, or is `SyncMode::NoSync` test-only? | M2-51, TA-21 | ADR-0008 | Test-only plus a `--unsafe-no-sync` daemon flag that forces `durability=PersistentUnverified` and logs a `warn` on every startup. It is needed to test the capability downgrade, and an undocumented test-only path tends to become an undocumented production path. |
