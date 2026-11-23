@@ -112,8 +112,9 @@
 # anything, an image with neither, and a --basis that disagrees with the label.
 #
 # #80 S4 (ADR-rdb-0025). The rig's node ids live in /init/nodes.txt, one `N STATE` line per id
-# ever given (live, removed, foreign, unserved); every session's --nodes and a new node's
-# --peers name the live ones. `up` writes it, then ends with one `rebalance` (Q6 a).
+# ever given (live, removed, foreign, unserved); every session's --nodes names the live ones,
+# and a started node's --peers every id from 1 to the highest live id or its own, removed ones
+# included (node_peers). `up` writes it, then ends with one `rebalance` (Q6 a).
 #   add          add-node the next id at the next IP (.10+N, machine label the IP), sign its
 #                certificate (--issue-node), start <name>-dN like up's nodes, ready in 120 s.
 #                Later sessions name it in --nodes (S-6). Records A3's baseline.
@@ -247,6 +248,16 @@ peers() { peers_with ""; }
 peers_with() { # an id to name besides the live ones, or nothing
     local n s=""
     for n in $( { live_ids; [ -z "$1" ] || echo "$1"; } | sort -nu); do s="$s${s:+,}$n=$(node_ip "$n"):7101"; done
+    echo "$s"
+}
+# A data node's --peers (PR #244 review): rdb_node's peer_set takes --node and --peers as
+# nodes 1 to K with no gap, so it names every id from 1 to the highest live id or its own,
+# removed ids included (the node skips those, start_peer_removed_skipped). Ids above that may
+# be left out, live or removed. Sessions' --nodes stay the live ids (peers, peers_with).
+node_peers() { # own id
+    local n k s=""
+    k="$( { live_ids; echo "$1"; } | sort -n | tail -n 1)"
+    for n in $(seq 1 "$k"); do s="$s${s:+,}$n=$(node_ip "$n"):7101"; done
     echo "$s"
 }
 voters_arg() { local n s=""; for n in $(seq 1 "$VOTERS"); do s="$s${s:+,}$n=$(voter_ip "$n")"; done; echo "$s"; }
@@ -445,7 +456,7 @@ run_data_node() { # node [cert dir]
     own_volume "$NAME-d$n"
     docker run -d --name "$NAME-d$n" --label "$LABEL" --network "$NET" --ip "$(node_ip "$n")" \
         "${NODE_RESTART[@]}" -v "$NAME-d$n:/data" -v "$NAME-init:/init:ro" "$IMAGE" data --node "$n" \
-        --dir /data/db --listen 0.0.0.0:7101 --peers "$(peers_with "$n")" --control "$(control)" \
+        --dir /data/db --listen 0.0.0.0:7101 --peers "$(node_peers "$n")" --control "$(control)" \
         --control-tls /init/certs/control --cert-dir "$certs" --admin-apps admin \
         --failover "${NODE_READD[@]}" --log-dir /data/logs >/dev/null || die "node $n start"
     say "node $n at $(node_ip "$n")"
@@ -972,10 +983,11 @@ def members(status_path, placement_path, partitions, removed, added):
         verdict(held == 0, f"A7 the placement gives removed node {n} no copy (copies={held})")
         # rdb_dev's `admin status` prints the record remove-node leaves (layout 3, state
         # removed) as `removed node=N addr=.. machine=..`, a live record as `node=N ..`, and
-        # bytes nothing decodes as `<undecodable>` (PR #244 review). Only the first passes.
+        # bytes nothing decodes as `<undecodable>` (PR #244 review). Only the first passes, and
+        # only whole: `removed node=N addr=<A> machine=<M>`, A and M one word each, no more.
         body = node_records(status_path).get(n, "<no nodes/ line>")
         why = {"<undecodable>": "the record's bytes do not decode, as live or removed"}
-        verdict(body.startswith(f"removed node={n} "),
+        verdict(re.fullmatch(rf"removed node={n} addr=\S+ machine=\S+", body) is not None,
                 f"A7 removed node {n} is out of membership: nodes/{n} is a removed record",
                 [f"nodes/{n}: {body}" + (f" ({why[body]})" if body in why else "")])
 
@@ -2700,6 +2712,12 @@ selftest_s4() {
     grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$out" \
         && grep -q 'nodes/2: <undecodable> (the record.s bytes do not decode, as live or removed)' <<< "$out"
     st "members fails A7 on undecodable bytes, saying so apart from a removed record" $?
+    for tail in "removed node=2 addr=$ip.12:7101 machine=" "removed node=2 addr=$ip.12:7101" \
+            "removed node=2 addr=$ip.12:7101 machine=$ip.12 extra" "removed node=23 addr=$ip.12:7101 machine=$ip.12"; do
+        s4_status "[4:owner,5:regular,6:regular]" "$tail" > "$t/stat.tail"
+        grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$(analyze members "$t/stat.tail" "$t/pl.ok" 2 2 -)"
+        st "members fails A7 on a removed record with a malformed tail ($tail)" $?
+    done
     s4_status "[4:owner,5:regular,6:regular]" - > "$t/stat.norec"
     out="$(analyze members "$t/stat.norec" "$t/pl.ok" 2 2 -)"
     grep -q '^FAIL A7 removed node 2 is out of membership' <<< "$out" && grep -q 'nodes/2: <no nodes/ line>' <<< "$out"
@@ -2750,6 +2768,22 @@ selftest_s4() {
             SUBNET=10.9.9.0/24; echo "$(live_ids | tr '\n' ' ')|$(ever_max)|$(peers)|$(peers_with 7)")"
     [ "$out" = "1 3 4 5 6 |8|1=10.9.9.11:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101|1=10.9.9.11:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101,7=10.9.9.17:7101" ]
     st "live_ids, ever_max, peers and peers_with read nodes.txt ($out)" $?
+    # A node's --peers: 1..K with no gap, removed ids kept, so an add after a remove starts.
+    out="$( NODES=5 NODES_TXT=$'1 live\n2 removed\n3 live\n4 removed\n5 live\n6 live'
+            SUBNET=10.9.9.0/24; echo "$(node_peers 7)|$(node_peers 3)")"
+    [ "$out" = "1=10.9.9.11:7101,2=10.9.9.12:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101,7=10.9.9.17:7101|1=10.9.9.11:7101,2=10.9.9.12:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101" ]
+    st "node_peers names 1..K with no gap, removed ids 2 and 4 kept, after a remove then an add ($out)" $?
+    out="$( NODES=5 NODES_TXT=$'1 live\n2 live\n3 live\n4 live\n5 live\n6 removed'
+            SUBNET=10.9.9.0/24; node_peers 3)"
+    [ "$out" = "1=10.9.9.11:7101,2=10.9.9.12:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101" ]
+    st "node_peers leaves out a removed id above every live one ($out)" $?
+    # ... and run_data_node gives the node that list.
+    out="$( docker() { [ "$1" = run ] && printf '%s\n' "$@" > "$t/run-args"; return 0; }
+            own_volume() { :; }; say() { :; }
+            NAME=rdbst VOTERS=1 NODES=5 NODES_TXT=$'1 live\n2 removed\n3 live\n4 live\n5 live\n6 live'
+            SUBNET=10.9.9.0/24 IMAGE=img; run_data_node 6; grep -A1 -x -- --peers "$t/run-args" | tail -n 1)"
+    [ "$out" = "1=10.9.9.11:7101,2=10.9.9.12:7101,3=10.9.9.13:7101,4=10.9.9.14:7101,5=10.9.9.15:7101,6=10.9.9.16:7101" ]
+    st "run_data_node 6 after removing 2 passes --peers 1..6, 2 included ($out)" $?
     # Commands against a stub rig whose nodes.txt says 2 was removed and 6 added.
     mkdir -p "$t/bin"
     cat > "$t/bin/docker" <<'SH'
