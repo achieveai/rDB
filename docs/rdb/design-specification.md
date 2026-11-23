@@ -140,6 +140,17 @@ One transaction WriteBatch contains its deterministic mutation list/history enve
 
 A logical history record is retained in RocksDB as data; native engine WAL sequence numbers are not the cross-node replication identity. Core engines may mix many partitions in the physical WAL; each partition still has its own logical ordered history.
 
+**Amended 2026-11-20 (issue #61): History is kept from a floor F.** A lineage's History need not start at seq 1. ADR-rdb-0027 has the decision.
+
+- **The floor.** A trim writes one engine-private `TrimFloor { seq, root_base, root_digest }` record on the lineage. Its `seq` is the floor F. History then holds `F..=applied`. The record **at** F is kept; nothing below it is.
+- **Reading it.** `RocksEngine::floor` walks the lineage's chain through every link, `copied` ones included, and answers the highest mark that cuts what the lineage reads. `RocksEngine::floor_seq` is its seq, or 0 on a lineage never trimmed.
+- **The trim.** `RocksEngine::stage_trim_history` is one unsynced `WriteBatch`. It deletes `[0, F)` on the lineage's own level, and on each level reached through a link at base `b` it deletes `[0, min(F, b+1))`. It marks every level it cuts, and a mark never goes down. A parent's records above a link's base (an issue #105 tail) are never touched.
+- **What refuses a trim.** The engine refuses a lineage that is staging, installing or sealed, a floor above `applied`, and a floor below the current one. The host also refuses while an inventory pin is held (`inventory_pinned`), and past the lowest `S` of a snapshot transfer it serves (`transfer_pinned`).
+- **The ladders follow.** The host trims R1's ladders first, then the engine, then the ladders it keeps, in one step, so no ladder holds a rung below F (ADR-rdb-0005).
+- **A trim is local.** It is one copy's cleanup, not a replicated write. No `applied` mark moves.
+- **The other writer.** A snapshot install writes a floor at its barrier `S` (§10.1).
+- **Who trims in this release.** Only the debug-build dev tool `rdb_dev admin trim-history --through N` (`Db::trim_history`). The automatic trim, with its keep window and byte cap, is a later change.
+
 ### 4.2 Initial bounded budgets
 
 | Resource | Initial rule | Failure behavior |
@@ -147,7 +158,7 @@ A logical history record is retained in RocksDB as data; native engine WAL seque
 | Data-engine memory | Shared cache budget ≤25% node RAM; shared memtable budget ≤15%; tune within a total ≤60% DB-process RAM envelope | Backpressure before host OOM; include native allocations in measurement |
 | Local queues | Max 1,024 waiting requests/partition and 64 MiB/core set, whichever trips first | `OVERLOADED`, before admission |
 | Transaction envelope | Max 255 client mutations per request, so the envelope holds at most 256 writes with the primary's one dedup write; max 1 MiB encoded envelope bytes; fixed v1 defaults. The primary checks both before it writes. No two writes (`Put` or `Delete`) in one request name the same key; conditions are not counted | `INVALID_ARGUMENT` before mutation |
-| API request limits | `rdb_api::Db` checks four limits before anything is compiled, sent or read (M9 S5): an object id of at most 1,024 bytes, on every write and read; a map key or set member of at most 1,024 bytes (text counts UTF-8 bytes), in any element op and as a members page's `after`; at most 255 ops in one change and 255 puts in one transaction; a page (members or list items) of at most 1,000 items. **The page cap counts items, not bytes**: one page can still be large. A page byte cap and a range read's length cap are carried to M10. M10's wire must call the same checks (ADR-rdb-0013 decision 11) | `INVALID_ARGUMENT` before compile; nothing is sent; the detail ends `request R not sent` or `not read` |
+| API request limits | `rdb_api::Db` checks four limits before anything is compiled, sent or read (M9 S5): an object id of at most 1,024 bytes, on every write and read; a map key or set member of at most 1,024 bytes (text counts UTF-8 bytes), in any element op and as a members page's `after`; at most 255 ops in one change and 255 puts in one transaction; a page (members or list items) of at most 1,000 items. **The page cap counts items, not bytes**: one page can still be large. A page byte cap and a range read's length cap are carried to M10. M10's wire must call the same checks (ADR-rdb-0013 decision 11) | Before compile; nothing is sent; the detail ends `request R not sent` or `not read`. A size or count the call carries (id, key or member, ops, puts) is `TOO_LARGE` (#148): its error names the limit, the size and the most it allows. The page cap is a count the read asks for, so it stays `INVALID_ARGUMENT` |
 | Core-set count | One per configured primary execution core, not every logical hardware thread by default | Record actual map in benchmark/configuration |
 | Disk headroom | Stop new placements at 70% allocated capacity; warning at 80%; stop new writes at 90% | Preserve room for compaction/recovery; alert before rejection |
 | Background moves | At most one inbound and one outbound bulk transfer/node; initial cap 10% measured disk/network sustainable bandwidth | Foreground budget wins; pause transfers on p99 breach |
@@ -328,11 +339,13 @@ All API reads, snapshot/export workers, actor readers, timers and outbox dispatc
 
 The barrier waits for the in-flight transaction or obtains an immutable snapshot at the previous published prefix. Maintenance cannot export partially published state; isolated diagnostic/recovery readers cannot produce application effects.
 
-Within one active generation, primary reads pass the same authority gate and serial queue; they see an ordered whole-transaction prefix. Healthy secondary reads are not exposed in v1. After recovery, reads declare the new generation and may observe loss of previously acknowledged values.
+Within one active generation, primary reads pass the same authority gate and serial queue; they see an ordered whole-transaction prefix. Healthy secondary reads are not exposed in v1, except the change feed (below). After recovery, reads declare the new generation and may observe loss of previously acknowledged values.
 
 Dedup key is `(tenant, client_id, request_id)` scoped to its affinity group and generation; store request digest and result atomically. Same identity with changed payload is `REQUEST_ID_REUSE`. Keep dedup entries at least 24 hours; beyond retention callers cannot infer nonexecution from absence. So a retry is deduplicated only inside the retention window: past it, a retry with the same identity is admitted as a new request and may apply again, at a new sequence, unless it names an expected generation that has since changed (clarified 2026-10-18, M9 S3; row M7A-89; [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §4).
 
 **Amended 2026-10-22 (M10, lead rulings A-R181, A-R182): the retention window is an app option.** 24 hours stays the default. An app may set a shorter window with `DbConfig::dedup_retention` (`crates/rdb-api/src/db.rs`; its doc and `DbConfig::dedup_cap`'s give the write rate each window sustains and the memory per entry). The cost is the rule above, sooner: past the window, a resend or a status query with the same identity cannot be settled.
+
+**Amended 2026-11-19 (#87, ADR-rdb-0020, ruling R-Q1): the change feed is history, not a state read.** `Db::changes` returns whole committed transactions from `History` in `seq` order. It never reads a key's current value, so the publication barrier above does not apply to it. The owner serves up to its published prefix, never applied-but-unpublished records. A regular secondary serves up to what it applied, which can include records the owner has not yet published, only while its own read of `partitions/{p}` began within `grant_millis`, names the generation it landed and pins it regular. A record a later promote cuts is reported to the consumer as `Rewound`, never silently dropped. A consumer with lasting external effects waits for `Db::wait_durable` on a record before acting on it.
 
 A retry with stale expected generation returns `GENERATION_CHANGED` before any mutation. The caller must reconcile on recovery; it must not silently retry a lost-generation transaction as a new effect. A transaction received by a replica may recover even if its client never saw success.
 
@@ -364,6 +377,7 @@ stateDiagram-v2
 | `RECOVERY_READ_ONLY` | Retry after health/authority recovers; do not assume already-admitted request failed |
 | `PROTECTION_PAUSED` | Retry after health/authority recovers; do not assume already-admitted request failed. Proves no mutation by this submission (amended 2026-10-22, below) |
 | `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | Definitive rejection before mutation; caller changes request intentionally |
+| `TOO_LARGE` | Definitive rejection before anything is sent (#148): an id, key, value, op or put count, or chunk over its limit, or a byte put's or transaction's whole write over the write limit; the error names which, the size and the most allowed. Never retried as is: split or shrink the call. A map, set or list write, or a document write that is not a byte document, over the record is the compile's `INVALID_ARGUMENT` instead, and nothing is written |
 | `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | Definitive no-admission; bounded jittered retry |
 | `UNKNOWN_OUTCOME` | Query status with same identity; do not generate a new request ID |
 | `GENERATION_CHANGED`, `REQUEST_ID_REUSE`, `UPLOAD_CHUNK_CONFLICT` | Reconcile or fail; never transparent replay; chunk conflict means the upload/index identity was reused with different bytes |
@@ -413,6 +427,8 @@ The storage adapter exposes `sync_wal_through(captured_prefixes)` as two halves,
 Writes may commit while the fsync runs. A write that returned before the sync began is durable once that sync succeeds. A write that commits during the sync is not credited by it: it is durable only after the next sync that begins after it returned. This is safe because, with manual WAL flushing off, each record reaches the OS before its write returns, and a sync covers every WAL file numbered at or below the current one when it begins.
 
 While a sync is in flight, the node's thread runs no synced write and no second sync, because RocksDB would make either one wait for that fsync. Such writes are staged, unsynced, and the next sync makes them durable. A sync in flight longer than `sync_stuck_millis` (default 30 s; 5 s before issue #109) is a stuck disk: when the watchdog finds it still in flight past that limit, the node faults, and its grant lapses for another node to take over. A slower sync that returns within `sync_stuck_millis` is slow, not a fault: it credits nothing until it returns, L1 pauses admission on unsafe age meanwhile when the slow node is the primary or holds the quorum's last secondary (§6.2), and the host logs it at Warn once it passes 5 s (`wal_sync_slow_in_flight` while it runs, then `wal_sync_slow` when it returns to the live node). A sync the watchdog finds still in flight past the limit faults the node, and its later return does not clear that fault. On that already-faulted path, the returning sync logs `sync_finished_after_fault` (Info), as a sync that returns at stop logs `sync_finished_at_stop`. A sync that returns past the limit but is handled before the watchdog looks is not a fault, and logs `wal_sync_slow` (Warn) like any other slow return. An fsync that returns an error advances nothing, as before.
+
+Known limit (issue #142, fix tracked as #152): on Linux with XFS, the node's thread still waits on the fsync, inside the kernel. XFS holds the WAL inode's lock (`xfs_ilock`) for the whole journal force of an fsync, and the node's next WAL append needs that lock. So a commit can wait as long as the syncer's journal force: a few milliseconds on a quiet disk, and 300-800 ms when other writers keep the journal busy (measured on the shared build host, 2026-11-20). `host_slow_step` logs such a step. Issue #152 removes the wait by moving the WAL's `write` to the syncer (`manual_wal_flush`). `scripts/thread-waits.py` shows which kernel wait a slow node thread is in.
 
 Disable manual WAL flushing and optional concurrent or pipelined writes unless this ordering is requalified. The adapter must prove that the chosen native version fsyncs every captured complete transaction; a memtable flush is not a substitute.
 
@@ -498,7 +514,7 @@ flowchart LR
 | Key family | Required content |
 |---|---|
 | `cluster/schema` | Cluster UUID, protocol/schema versions, minimum compatible data version |
-| `nodes/{id}` | Boot UUID, role, failure domain, capacity, cores, drain state. *Amended by ADR-rdb-0023:* layout 1 holds the node's address and machine only, written by the declaration (`admin::declare`), create-only; the boot comes from the link handshake; the rest is not stored yet |
+| `nodes/{id}` | Boot UUID, role, failure domain, capacity, cores, drain state. *Amended by ADR-rdb-0023:* layout 1 holds the node's address and machine only, written by the declaration (`admin::declare`), create-only; the boot comes from the link handshake; the rest is not stored yet. *Amended by ADR-rdb-0023 Decision 6 (#83 B2):* layout 2 adds the node's app address, which the node itself CASes into its own record at open, changing only that address; the declared address and machine are never rewritten. An open given no app address on a new or emptied node folder also writes the record: a fence that CASes the record's own bytes back at the revision it read, so the revision changes and the body and layout do not (PR #159 review r4) |
 | `grants/{node}` | Grant ID, authority generation, allowed boot UUID, expiry, renewal version, mode |
 | `partitions/{id}` | Range, group-hash version, owner, owner epoch, generation, membership/config version, lineage root, lifecycle state |
 | `routes/{range}` | Versioned route root/manifest pointer; authoritative atomic cutover key |
@@ -534,6 +550,8 @@ stateDiagram-v2
 **Amended for issue #80: control-plane uncertainty does not remove admission.** A node that cannot reach rEtcd, or does not know whether a renewal committed, keeps serving writes and reads on the grant it has already proved, up to that grant's horizon: `renewed_at + grant_millis − dispatch_margin_millis − 1`, about 5.9 s after its last committed renewal at the defaults. There it fences `Expired`. Meanwhile it takes no new grant and no promote runs. No-overlap rests on the grant alone: the old owner stops at `E − ε − δ` whatever it can read, and a new owner waits for `E + ε + δ`. [ADR-rdb-0007](../ADRs/rdb/0007-fenced-grants-and-epochs.md) "A control-plane `Unavailable` and an unknown CAS outcome neither deny nor fence" holds the full rule and what it costs.
 
 **Clock uncertainty is the clock guard's word (issue #80 S2c).** A node's clock bound holds only while the node and the peers whose fresh verdict (at most 5 s old) is Agree are a majority of the cluster, and outnumber the fresh Breaches. A node without one has no bound: it admits nothing (`ClockUnbounded`), and a promote run on its clock is refused before it writes anything.
+
+**Tick 0 is never a real step tick (issue #130).** A view that admits nothing has a horizon one tick before its step. At tick 0 that saturates to tick 0 itself, so check 6 would admit a view A1 denies. A real node's ticks count Unix-epoch milliseconds, so they never read 0. Only the clock's dev hooks (`--clock-step-file`, `--clock-offset-ms`) can push a node there, and the host then refuses to step any kernel and faults. The simulator starts at tick 0. Its rows treat tick 0 as test-only.
 
 
 The selected design requires new fenced-grant semantics; inspected rDB surfaces do not establish an existing implementation. A grant service uses rDB consensus to serialize grant/renew/revoke state; it is not a separate authority outside rDB.
@@ -600,7 +618,7 @@ flowchart TD
 The automatic failover planner (#81) checks that it still holds `planner/grant` right before each promote and sends none once the grant has run out (`planner_promote_skipped_grant_expired`). It checks again after a promote answers, and logs one whose grant ran out meanwhile as `planner_promote_observed`, not `planner_promoted`. The checks narrow the window and cannot close it: a grant can lapse during a promote, so safety rests on the store's fence and the `FENCING` CAS below, as for any promoter.
 
 
-1. CAS partition state to `FENCING`; freeze old-node grant renewal using its exact revision. Serialize renew/freeze races in rDB. A frozen record belongs to the takeover that froze it, and nothing else clears it, with one exception (#81 X2, owner answer (a) on #81, 2026-11-19): the failover planner, only while it holds `planner/grant`, deletes a frozen `grants/{node}` at its exact `mod_revision` when all of these hold, judged on `partitions/` read again after that grant read (a failed read refuses the clear), and with `planner/grant` checked again right before the delete: its boot is older than the node's live boot, no `partitions/` record names the node as owner in any lifecycle (`FENCING` included), and its expiry is proven past (`clear_frozen_verdict` in `crates/rdb-core/src/authority/grant.rs`). The node's new boot can then be chosen and promoted again. A freeze after the delete recreates the key frozen, so a later takeover still fences.
+1. CAS partition state to `FENCING`; freeze old-node grant renewal using its exact revision. Serialize renew/freeze races in rDB. A frozen record belongs to the takeover that froze it, and nothing else clears it, with one exception (#81 X2, owner answer (a) on #81, 2026-11-19): the failover planner, only while it holds `planner/grant`, deletes a frozen `grants/{node}` at its exact `mod_revision` when all of these hold, judged on `partitions/` read again after that grant read (a failed read refuses the clear), and with `planner/grant` checked again right before the delete: its boot is older than the node's live boot, every `partitions/` record naming the node as owner is `SERVING` (one in `FENCING` or `FENCING_DRAINED` refuses: a takeover is under way; #172 option C, owner-approved 2026-11-20, widened this from "no `partitions/` record names the node as owner in any lifecycle (`FENCING` included)"), and its expiry is proven past (`clear_frozen_verdict` in `crates/rdb-core/src/authority/grant.rs`). The node's new boot can then be chosen and promoted again, and heals the `SERVING` partitions it still owns (a `lone_survivor` a partial failover left behind) as owner at a new generation: with a planner configured, the reopen's heal waits for this clear instead of failing (`clear_until` in `crates/rdb-api/src/admin.rs`). A freeze after the delete recreates the key frozen, so a later takeover still fences. A promote whose `FENCING` write lands after the clear's `partitions/` read and before its delete is settled on the promote side, never by the planner's re-checks; the outcomes are listed under "The clearing service does not race a fence" below.
 2. Ask the old owner to drain, stop queues and persist an irrevocable partition-epoch revocation. An ACK counts only if restart cannot restore that epoch.
 3. If no verified drain/revocation, await final grant expiry under the clock contract or verified external fencing. Expiring a node grant may temporarily fence its other partitions too.
 4. Issue a renewed grant excluding the revoked partition epoch to a cooperative old owner; install new membership/generation and owner epoch in one authoritative partition record.
@@ -609,9 +627,21 @@ The automatic failover planner (#81) checks that it still holds `planner/grant` 
 
 **Built: the shared freeze, and an opt-in planner (amended 2026-11-15, PR #119, issue #81 C1; replaces the A-R94 "owed to the planner" text).** Two `rdb-api` paths write `grants/*` for a takeover, and both go through one function, `admin::freeze`: the operator's `Db::promote_partition` and the opt-in failover planner (`planner.rs`, started only when `DbConfig::failover` is set; off by default). The simulator's `clear_restarted_grant` and the host's `admin::clear_grant` (and the reopen's heal, which runs the same `judge`) remain the clearing services.
 
+**Amended 2026-11-20 (R5): the reopen's heal proceeds with a majority after a process restart (arch-s2 B1, A-R271; PR #181 ruling A, ADR-rdb-0028).** Only with `Timeouts::live_readd` on: off, the heal waits for every copy as before (`heal_wait_all{reason=live_readd_off}`), and the one predicate `admin::may_leave_out` holds that policy. Before this, a restarted owner's heal waited for the boot of every non-shadow member its records pin, so one down copy kept every partition it shared with that owner unopened.
+- **Same OS boot (Linux), majority up:** a down copy may be left out of the heal's plan when a majority of the partition's pinned non-shadow members, the owner included, is up, and the down copy's `grants/{C}` is frozen, or its expiry is proven on the owner's clock by the same inequality guard 2 of `clear_verdict` uses (`expiry_proven`). With a live grant, an unreadable or undecodable grant (`grant_unread`, `grant_undecodable`), or no established clock bound, the heal keeps waiting. A down copy with no grant record (only an owner takes one, so a copy that never owned a partition has none, alive or not) is waited for one full heal window from the heal's start (`no_grant_record`), then left out (`evidence=no_grant_after_window`). Every left-out copy is noted at `UNLINKED_BOOT`, never at the boot a grant names: a frozen or expired record can name an older process of a node that already runs again, so it is no proof of a restart. Its first link back is a #107 live return, which the owner's live re-add takes back whether the copy never stopped or started again. Leaving out a copy that may be alive costs availability only: the owner's WAL holds every acknowledged write (below), the new generation pins its members' boots so the copy's acknowledgements no longer count, and the copy cannot become owner without freezing the owner's live grant. Shadows stay exempt, as before. Logged `heal_proceed_without{partition, missing, present, majority, reason=same_os_boot, evidence}`.
+- **Why this is safe:** an owner acknowledges a write once it is in its WAL, unsynced, and on one regular secondary (§5.2 steps 3 and 6); the sync comes later (step 7). A process restart under the same OS boot keeps that WAL, unsynced tail included, so the owner's log holds every write it acknowledged, and recovery's `holds_last_writable` check confirms it on the copies present.
+- **Host crash:** the unsynced tail may be gone and the down copy may be its only holder, so the heal waits for every copy, or for `admin forget-tail`. So does a changed, missing or unreadable OS boot id, and any non-Linux build. Each attempt that waits logs `heal_wait_all{reason}` with its first wait reason, and again when the reason changes: `os_boot_changed`, `os_boot_unknown`, `unsupported_platform`, `live_readd_off`, `no_majority`, `partition_forming`, `copy_not_proven_down`, `grant_unread`, `grant_undecodable`, `no_grant_record`, `no_clock_bound`. Separately, an attempt whose answer came at or past its deadline acts on nothing and ends `PeersUnknown`. Only a late decision, one that would have left a copy out, ends with reason `decided_past_deadline` and logs `heal_leave_out_expired`; a late wait keeps its own reason and logs `heal_wait_all` as any wait does, with the attempt's first wait reason and again when the reason changes. An attempt also ends `PeersUnknown`, keeping its wait reason, when its next look at the links would fall at or past its deadline. All are retried automatically, each attempt with a whole budget. After a late wait the new attempt asks again: it leaves the copy out if it now may (`evidence=grant_frozen`, `grant_expired` or `no_grant_after_window`), and the copy comes back by live re-add; only a wait that ends in none of those must have the copy back.
+- **Bound:** the wait for a crashed copy is one grant lifetime plus epsilon and delta, not a constant, and only while the owner's clock has an admissible bound. With no bound established no expiry is proven and the heal waits as `no_clock_bound`; with a sample too old or too wide it waits as `copy_not_proven_down`. A copy that keeps renewing has no fixed wait: it ends when its link comes up, when its grant is frozen, or when it stops renewing and the owner proves its grant expired.
+- **Detection:** each copy's own `nodes/<n>/os_boot` file (stage, fsync, rename), written once an open of that node is ready with its heal done, never while the heal runs or after it failed, and removed at open when the id differs, is empty, or cannot be compared (the OS's id unreadable, or a non-Linux build). Node processes sharing a folder keep one each, so a node that leads nothing never stamps an owner's. A container shares its host's kernel boot id, so a container restart is the same boot, which is correct.
+- **Known limits:** a VM or disk snapshot restore, or network storage that drops its write cache without a reboot, keeps the boot id while losing the tail. An operator restoring a snapshot treats it as a host crash: delete the node's `nodes/<n>/os_boot` before starting it.
+- **Follow-up, not built:** a clean-close "synced" marker would let a clean shutdown heal with a majority after a reboot too.
+
 - **Step 1 when the old owner has no grant.** `admin::freeze` CASes the prior owner's grant `frozen` at the exact revision it read, or, when `grants/{node}` is absent, **create-only writes a frozen `GrantRecord`** for that node: `GrantId(0)` ("none held"), the prior owner's boot from the partition's root, and the promoter's control-time estimate now as `expiry_utc_ms`. A record already frozen is kept. The reasoning is unchanged: an absent record cannot tell a cleared grant from one never issued or about to be issued, so absence proves nothing; the frozen create gives the candidate a frozen record to prove expiry against (`expiry_proven`, the inequality of `clear_verdict` guard 2), blocks the node's create-only acquisition, and is never deleted by a clearing service (`clear_verdict` guard 1, "not frozen"). Safety does not rest on the expiry value, because the create-only write succeeding already shows no grant stands. It is cleaned up like any frozen grant, under step 4.
 - **The clearing service does not race a fence (closes the M9 tripwire).** rEtcd still has no multi-key compare, and the clearers still read `partitions/*` (guard 3) and then delete the grant with a compare on the grant key's revision alone. The race is closed on the promote side instead, because every fence is followed by a freeze attempt on that same key (a freeze that fails for another reason than `OwnerAlive` can return before it writes anything):
-  - A delete that lands after the freeze cannot apply: the freeze's CAS or create moved the grant's revision, so the clearer's compare fails, and guard 1 refuses a frozen record on any later pass.
+  - A delete that lands after a freeze that wrote cannot apply: the freeze's CAS or create moved the grant's revision, so the clearer's compare fails, and guard 1 refuses a frozen record on any later pass.
+  - A delete that lands after a freeze that wrote nothing does apply (#172). When `owner_dead` already read the record frozen, by an earlier promote of another partition, the freeze logs `promote_frozen_already` and leaves the revision as it was, so the clearer's delete at that revision lands. What follows depends on when the promote's target binds the proof. `bind_routed_fence` binds only while `partitions/{p}` is at the proof's `FENCING` revision and the prior owner's grant is the frozen one the proof names.
+    - Bound after the delete: the target refuses the proof (`routed_fence_refused`, reason `grant` while `grants/{node}` is absent, `revision` once anything has moved the record), and nothing is written. The restarted owner's heal, planned against the `FENCING` record that still names it, commits by its CAS at that revision, and the promote ends `Superseded`. Rows `i172_a_freeze_before_the_clears_delete_lets_the_restarted_owner_heal_first` and `i172_a_freeze_before_the_clears_delete_leaves_the_promote_no_fence_to_bind`.
+    - Bound before the delete: the target's F1 commit and the restarted owner's heal commit are both CASes on `partitions/{p}` at the `FENCING` revision, and only one applies. If F1 lands first, the target owns the partition and the heal's commit is refused (`OvertakenByPeer`). If the heal lands first, F1's commit write is refused and the promote ends `Superseded` naming the owner (row `i172_a_promote_bound_before_the_delete_loses_its_commit_to_the_heal`). The partition compare keeps one owner here, not the grant's absence.
   - A delete that lands between the `FENCING` write and the freeze, when the owner was judged dead (`owner_must_be_dead`: always for the planner, and for an operator promote when the route has more than one partition): the freeze finds the record no longer at the revision `owner_dead` judged and returns `PromoteError::OwnerAlive`, with nothing frozen; the promote undoes its `FENCING` write by a CAS at the revision it wrote (`promote_fencing_undone`). If that undo fails or its outcome is unknown, the promote reads `partitions/{p}` again rather than assume what it holds (PR #119 review, `undo_unproven`). There are four outcomes, each with its own log line:
     - Still `FENCING` or `FencingDrained`: the promote is refused saying the partition is still fenced, and only then does a later promote resume from it (A-R447). Logged `promote_fencing_undo_failed`. The refusal makes no claim about writes: the owner came back, and its grant may still admit them.
     - Back to the record it fenced (the undo applied and only its answer was lost): the `OwnerAlive` refusal stands. Logged `promote_fencing_undone` with `answer_lost`.
@@ -619,7 +649,9 @@ The automatic failover planner (#81) checks that it still holds `planner/grant` 
     - Any other record, such as a newer owner or generation committed meanwhile: the undo was overtaken. The promote is refused naming that record's owner, generation, lifecycle and revision, with nothing left to resume, and the record is left as it is. Logged `promote_fencing_undo_overtaken`.
 
     A rollback that answers, and a promote of a `Serving` record, are unchanged. F1's commit refuses a record that is not `FENCING`.
-  - The same delete when the owner was not judged dead (a single-partition operator promote): the freeze finds the key absent and creates it frozen, so the transfer proceeds against a frozen record, never a vanished one.
+
+    A heal planned against that `FENCING` record before the undo is planned again in the same open (#172, PR #218 review). Its commit CAS at the `FENCING` revision is refused and the owner's kernel blocks the recovery `CasContention`; the heal's watch (`heal_settling` in `crates/rdb-api/src/admin.rs`) then reads `partitions/` again and sends a fresh plan and fence against the `SERVING` record, within the heal's bound, and the partition is healed at the next generation. The fresh fence carries the first heal's evidence that the old boot's grant is gone; the grant is not cleared again, because by then the owner's recovery of a sibling partition may hold it at the new boot (PR #218 review, round 2). The re-plan is bounded by the heal's deadline, a transient store error is tried again within it, and a re-plan that fails is what `wait_ready` answers. Only that block is planned again: `OvertakenByPeer`, a re-read record naming another owner, and `ControlUnknown` still stop the heal. `ProposalUnresolved` and `ActivationUnresolved` do not: F1 resolves them by reading `partitions/{p}`, and the watch waits on them. Rows `i172_a_heal_planned_against_an_undone_fencing_plans_again_in_the_same_open` and `i172_a_heal_replan_with_a_sibling_holding_the_grant_heals_in_the_same_open`. This is the planner's race row `i172_a_promote_fencing_between_the_clears_read_and_delete_makes_no_second_owner` with the owner's heal in it.
+  - The same delete when the owner was not judged dead (a single-partition operator promote, the only promote with `owner_must_be_dead` false): the freeze finds the key absent and creates it frozen, so the transfer proceeds against a frozen record, never a vanished one. No planner promote takes this path.
   So "a grant cannot vanish mid-transfer" holds without the planner being the clearer and without a compare-transaction.
 - **Not for production.** The opt-in planner is not for production until fencing is shown on a real rEtcd cluster with real clocks (owner's note, 2026-11-15).
 - **Still owed.** The planner is opt-in and not released: spec §1's rule stands, that no automatic failover is released until its clock, revocation and stale-request tests pass, and the gate it must pass is owned by ADR-rdb-0019. C2, the frozen node's return, is built: the node restarts at a new boot (`rdb_node` exits 75), is re-added as a regular copy, and the planner's X2 clear (step 1) deletes its frozen grant, so it can be promoted again. The remaining #81 rows (C3, S2 to S4) are not built. A frozen record left by a takeover is cleaned up under step 4, or by the planner under step 1's X2 exception.
@@ -746,6 +778,13 @@ Returning replicas with stale suffixes are quarantined read-only for diagnostics
 
 Quarantined suffix retention defaults to seven days and capacity permits; deletion requires operational policy approval. It is not merged automatically into current data. A suffix adopted under §8.5 was never quarantined. Proven corruption may require manual restore and is outside automatic majority-loss recovery.
 
+**Amended 2026-11-20 (issue #61): how a copy behind the floor is rebuilt.** A copy whose head is below its primary's History floor (§4.1) cannot catch up record by record. It is rebuilt from a state snapshot (§10.1).
+
+- **The install is the staging and switch above, for this case.** `install_begin` deletes every lineage the partition holds on that copy and writes an `installing` record on the new lineage, in one batch. `install_chunk` writes each page. `install_finish` writes the barrier's History record, `applied = S` and a `TrimFloor` at `S`, and deletes `installing`, in one synced batch.
+- **A crash mid-install.** A lineage still `installing` at open is cleared (`snapshot_install_cleared_at_open`), and the copy rejoins empty.
+- **The old lineages are deleted at install start, not kept seven days.** That happens only after the target checked the offer's authority (§10.1). A copy whose tail scan finds a current issue #105 tail refuses the offer instead (§10.1). A superseded tail (§8.5) is deleted with the rest.
+- **The read-only window.** When the one copy left must rebuild the other before writes return, writes are refused `RECOVERY_READ_ONLY` until it has (§10.1).
+
 ### 8.5 A live copy's tail: the guard and the way back
 
 Added 2026-11-11 (issue #105, units 1 and 2). It states what the code does. The owner's decisions of 2026-11-09 are marked where they apply.
@@ -811,6 +850,13 @@ A holder adopts the tail inside its inventory answer. It then reports as an ordi
 4. **P2.** Every record from the base to the head reads, verifies and chains.
 5. **The write's preconditions** for the chosen way, below. These mirror what the storage engine's `inherit` would refuse, so `Adoptable` means the write will succeed.
 
+**Amended 2026-11-20 (issue #61): below a floor, adoption refuses.** P1 and P2 read History that a trim (§4.1) may have deleted. Then `Host::adoption` adopts nothing and answers `TailAdoption::Trimmed` (§8.5.6):
+
+- `tail_below_floor`, before P1, when the tail's lineage is trimmed above the anchor's base;
+- `base_below_floor`, from `Host::chain`, when the base is below the floor of the lineage P2 walks.
+
+Such a tail cannot come back by adoption. The copy is rebuilt by snapshot once it is given up (§8.5.9, §10.1).
+
 `Host::adopt` then writes it one of three ways:
 
 - **Link.** The copy holds no lineage at the anchor's generation. `inherit` links it onto the tail's lineage at the tail's head. At the chain depth ceiling (32 levels) the link is a full copy instead. That copy runs on the host thread, at most once per 32 levels.
@@ -827,7 +873,7 @@ After any of them, a receiver held on that copy is dropped. A catch-up it then s
 
 > A commit is writable only if a verified copy, of any role, on a node in L's regulars, holds lineage L intact.
 
-Intact means not staging, and holding a record at seq 1 when L applied any. A copy reports it as `SurvivorInventory.holds_last_writable`. A wiped or rebuilt copy fails it. A flattened copy passes.
+Intact means not staging, and holding a record at its floor when L applied any: seq 1 on a lineage never trimmed, else its trim floor F (amended 2026-11-20, issue #61; `Host::has_floor`, the read check B also uses). A copy reports it as `SurvivorInventory.holds_last_writable`. A wiped or rebuilt copy fails it. A flattened copy passes.
 
 The rule is waived while L is unknown, over a first generation, and for a run given `--no-intact-copy`. While it applies and no L-regular has verified intact, the discovery window waits once more for a silent one (`recovery_window_extended_for_intact`).
 
@@ -843,8 +889,9 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `NotReady(reason)` | The proofs hold so far, but a precondition is not met yet | Holds | Needs `--give-up-live-copy` |
 | `Refused(reason)` | A proof failed. The tail cannot come back | Holds | Needs no flag |
 | `Unchecked` | The copy refused without running the proofs, or a write failed after they held | Holds | Needs `--give-up-live-copy` |
+| `Trimmed(reason)` | The proofs could not run: the history they read is trimmed (issue #61; wire word `trimmed`). The tail cannot come back | Holds | Needs `--give-up-live-copy` |
 
-`ADOPTION_REFUSALS` holds every reason, 11 in all. The first three are `NotReady`:
+`ADOPTION_REFUSALS` is the wire vocabulary: the 11 reasons a peer can decode. The first three are `NotReady`. Two more refusals sit outside it: check B's floor refusals `tail_has_no_floor` and `tail_history_read_failed` (#121). A reason outside the list is reported as `Unchecked`, so it never crosses the wire as `Refused`.
 
 | Reason | State | Meaning |
 |---|---|---|
@@ -860,7 +907,9 @@ A copy holding a tail shows it in `Db::node_status` as `tail_refused`, with `ado
 | `anchor_lineage_differs` | `Refused` | Replay: the anchor's lineage does not chain into the tail |
 | `tail_too_long` | `Refused` | Replay: more than `ADOPT_REPLAY_MAX` records |
 
-`TailAdoption::could_return` is true for every state but `Refused`.
+`ADOPTION_TRIMMED` holds the two `Trimmed` reasons: `tail_below_floor` (the tail's lineage is trimmed above the anchor's base) and `base_below_floor` (the chain from the base is trimmed). A bare `forget-tail --through` over a `Trimmed` tail is refused with "they cannot come back: the history needed to adopt them is trimmed", naming the whole command `admin forget-tail --partition P --through H --give-up-live-copy`.
+
+`TailAdoption::needs_give_up_flag` is true for every state but `Refused`.
 
 The owner's membership repair re-plans only when every held tail is `Adoptable`. A stalled rebuild copy whose tail is `Adoptable` does not hold that repair back, since the re-plan is what adopts it.
 
@@ -907,7 +956,7 @@ It is refused, giving up nothing, when:
 
 - H is at or below the committed cutoff;
 - no copy holds a tail above the cutoff;
-- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), unless `--give-up-live-copy` is given. A holder the committed ledger marks that no repair probe has reported on yet counts as `Unchecked`; a probe's report, `Refused` included, stands over the mark. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
+- a live copy reports a tail that could come back (`Adoptable`, `NotReady` or `Unchecked`), or a `Trimmed` one (issue #61, below), unless `--give-up-live-copy` is given. A holder the committed ledger marks that no repair probe has reported on yet counts as `Unchecked`; a probe's report, `Refused` included, stands over the mark. For `Adoptable` and `NotReady` the refusal says the node "can bring them back; no operator action is needed". For `Unchecked` it says that has not been checked;
 - `--no-intact-copy` is given and the intact rule did not cap the owner's last commit;
 - another re-plan is running.
 
@@ -915,9 +964,16 @@ The owner re-plans with `RecoveryPlan.release`. F1 copies `through` onto that ru
 
 What is given up is gone for good. Being accepted does not mean writable: the re-plan can still commit `ReadOnly`, for example with too few copies. The next run then holds the tail again.
 
+**Amended 2026-11-20 (issue #61): trimmed tails, and a copy outside the membership.**
+
+- **A `Trimmed` tail needs `--give-up-live-copy`.** It cannot come back, but nothing proved it superseded, so it may hold the only copy of an acknowledged write. Without the flag the refusal says the seqs "cannot come back: the history needed to adopt them is trimmed", and names the whole command: `admin forget-tail --partition P --through H --give-up-live-copy`.
+- **A copy that refused this owner's snapshot offer is counted.** Such a copy may be outside the membership, so no repair probe and no ledger entry names it. The owner keeps each `tail_held` refusal it hears as an offer hold (`offer_holds`, logged `offer_hold_recorded`), and forget-tail counts it as `Unchecked`, so it needs `--give-up-live-copy`. Without this, the ask would be refused "nothing for --through to give up".
+- **What an accepted ask does with a hold.** Every hold at or below H is dropped (`offer_hold_released`). The answer names each one: `copy N on node M: seqs C+1..=H given up for good`. No offer is sent then. The re-plan's writable commit supersedes the tail, and the next ordinary catch-up offer rebuilds the copy (§10.1).
+- **Holds live in memory.** An owner restart loses them. The copy then refuses the next offer again, and the owner records the hold again.
+
 #### 8.5.10 Upgrade, release and limits
 
-**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 9. An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
+**Owner decision (2026-11-09): the upgrade is one-way.** This build writes record layout 6, stored promote plan version 4 and `PROTOCOL_VERSION` 12 (9 when this was decided; issue #107 slice 2b and issue #87 moved it to 10, issue #61's snapshot wire to 11, and #147 and #148 to 12, and each of those upgrades is also stop every node and every app process linked to them, upgrade them all, start the nodes, then the apps; an app process at another version is refused at the handshake as a node is). An older build reads a layout 6 record as undecodable, and the handshake refuses a version mismatch. So the whole cluster stops and restarts together, and there is no rollback. Until a partition's first writable commit on this build, L is unknown there: the intact rule is waived, and a tail found is refused `last_writable_unknown`. Such a tail needs `forget-tail` once. It needs no `--give-up-live-copy`, because it cannot come back.
 
 **Owner decision (2026-11-09): units 1 and 2 release together.** Unit 1 alone can only give a live copy's tail up.
 
@@ -993,20 +1049,58 @@ No dedicated shadow pool is mandatory. In v1, a shadow-eligible node is configur
 
 ```mermaid
 sequenceDiagram
-  participant S as Authoritative source
-  participant DB as Logical history retention
-  participant T as Invisible target staging
-  S->>S: Capture partition barrier + snapshot
-  S->>T: Manifest + hashed chunks
-  S->>DB: Retain history after barrier
-  T->>T: Verify chunks and import staging prefix
-  DB->>T: Replay contiguous transactions
-  T->>T: Fsync exact seq + digest
-  T-->>S: Ready(barrier, seq, digest)
+  participant S as Primary (source)
+  participant T as Copy behind the floor (target)
+  S->>S: Open a transfer at S = applied, pin the trim at S
+  S->>T: SnapshotOffer once S is durable
+  T->>T: Authority check, or SnapshotOfferRefused
+  loop Until the last page
+    T->>S: SnapshotPull(after, chain so far)
+    S->>T: SnapshotChunk(entries, chain)
+    T->>T: Check the chain, then write the page
+  end
+  T->>T: install_finish: barrier record, applied = S, TrimFloor at S (synced)
+  T-->>S: ACK at S
+  S->>T: Records S+1 ..= head, then CopyCaughtUp releases the pin
 ```
 
-**Takeaway:** snapshot bytes are insufficient alone; the target stays invisible until verified catch-up reaches an exact durable lineage barrier.
+**Takeaway:** the target pulls a chained, paged view of the primary's state, checks each page before it writes it, and is caught up from `S` by ordinary records. The snapshot proves transport and lineage, not content.
 
+**Amended 2026-11-20 (issue #61, as built).** The diagram above is the build. The three paragraphs after this list are the original intent; where they differ, this list holds. ADR-rdb-0027 has the decision.
+
+- **When.** For a copy behind its primary's History floor (§4.1), R1's ladder holds no rung to check, and R1 emits `SnapshotCatchupRequired`. `Host::snapshot_catchup` serves it.
+  - If the primary's own ladder is not dense from the engine's floor to its head, it is refilled from the engine, and the copy is walked record by record (`snapshot_catchup_served{how="ladder"}`). A refill is never deduplicated.
+  - Only a dense ladder opens a transfer: the engine cannot serve the record either.
+- **Source.** A transfer is a paged `RocksSnapshot` view at `S`, the lineage's applied seq, plus a pin: a trim past `S` is refused (`transfer_pinned`) until the copy's `CopyCaughtUp`.
+  - One transfer per copy. While one of this generation is open, every ask is dropped, a newer barrier too (`snapshot_catchup_in_flight`).
+  - `snapshots_served` is keyed by `(generation, S)`. A repeat ask for the same barrier in the same generation is dropped. A later commit's ask at the same `S` is served again.
+  - A transfer ends on the copy's `CopyCaughtUp`, on the target's refusal, on the target node's `PeerBooted`, after 60 s with no pull (`SNAPSHOT_IDLE_MILLIS`), or on a page read fault.
+- **Target-started pull, chained chunks, no up-front manifest.** The source sends `SnapshotOffer` once its engine's `durable` reaches `S`. The target then pulls one page at a time (`SnapshotPull`). Each `SnapshotChunk` holds at most `COPY_BATCH_KEYS` entries.
+  - The pull carries the target's chain so far, so the source keeps no chain state.
+  - A chunk's chain is `Digest::of(Domain::Record, [SNAPSHOT_CHUNK_LABEL, prev, then each entry's namespace, key, value, version, generation])`. Chunk 0's `prev` is the barrier record's `record_digest`.
+  - The target checks each chunk before it writes it. A mismatch is refused `snapshot_install_refused{reason="chain"}`, and nothing is switched.
+- **The authority check comes first.** `Host::snapshot_offer` accepts an offer only when all of these hold. Otherwise it changes nothing, logs `snapshot_offer_refused{reason}`, and sends `SnapshotOfferRefused`, and the source drops its transfer and pin at once.
+  - Its live receiver adopted the offer's lineage (partition, generation, owner epoch) and copy (`not_adopted`).
+  - The offerer is that config's primary node and boot (`not_primary`).
+  - `S` is above its applied head (`not_ahead`).
+  - The barrier record decodes, names `S` and recomputes its digest (`bad_barrier`).
+  - Its tail scan finds no held issue #105 tail (`tail_held`, below).
+- **Delete at install, after that check.** The first chunk runs `install_begin`, which deletes every lineage the partition holds on that copy. `install_begin` and `install_chunk` are unsynced; `install_finish` is synced. A crash before the finish leaves either the old lineages, when the begin never reached disk, or an `installing` lineage, which the open clears (§8.4).
+- **Re-seed.** After `install_finish` the target re-seeds its receiver at `(S, barrier digest)` with `durable = S`, and sends the primary an unsolicited ACK at `S`. R1 takes it as any ACK: at the head it reports `CopyCaughtUp`; below it, it walks `S+1..=head`.
+- **Content is not proven.** The chain proves the pages arrived as the source sent them, in order, from that barrier. It does not prove the source's state is what its History would build (owner ruling Q5).
+- **Keep window plus cap.** The paragraph below names a 30-minute, 20-GB budget. In this build no automatic trim runs: History is trimmed only by the debug-build `rdb_dev admin trim-history`, and only the transfer pin and the inventory pin hold a trim back. A keep window (kept at least) and a byte cap (a hard cap that overrides a lagging copy and a transfer pin) are a later change.
+- **A held #105 tail refuses the offer.** `Host::offer_tail` runs the tail scan with L from the target's landed commit.
+  - A writable commit supersedes every older tail, so a copy left out of one never hits. A hit needs L unknown: a partition whose record an older build wrote, with no writable commit since.
+  - On a hit the target refuses `tail_held` with the tail's head H. It warns `copy_needs_forget_tail` once per partition and copy, and its `NodeStatus::needs_operator` names the copy, H and the command.
+  - The owner records the refusal as an offer hold (`offer_holds`). Its `needs_operator`, which `Db::readiness` shows as `PartitionReady::degraded`, names the same. `admin forget-tail` counts the hold (§8.5.9).
+- **A move's catch-up clock.** A move's shadow below the floor is rebuilt the same way. While the owner's transfer to that shadow serves more entries, the move's no-progress clock starts again (`Host::transfer_pulled`, `Host::move_lag_duty`).
+- **The read-only window.** History was trimmed, a copy was down past the floor, and then the owner died. The one copy left commits `ReadOnly` (§8.3 needs two copies for writes) and rebuilds the other by snapshot.
+  - During the window a write is refused `RECOVERY_READ_ONLY`, `retry = RetryAfterRecovery`, `no_mutation` true, with `retry_after` = `REBUILD_RETRY_HINT` (5 s) (`Host::named_read_only`, `Host::rebuilding_read_only`).
+  - The detail names the copy, its node, the entries and MiB sent and the seconds since the transfer opened, and ends with `REBUILDING_STEP`.
+  - The 5 s is a poll hint, not an estimate: the source knows what it has sent, not what is left.
+  - After the rebuild, the owner commits writable: `DegradedRf2` on the two copies while the third is down (lead ruling R21).
+
+Original intent:
 
 Take a partition-consistent snapshot at `(generation, seq, digest)`. Export only that partition prefix with a manifest of chunk hashes, sizes, format version and root digest; no assumption that a whole core-engine checkpoint is a per-partition transfer.
 

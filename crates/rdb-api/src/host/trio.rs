@@ -102,6 +102,35 @@ pub(super) fn write_chain_in(
     }
     digests
 }
+/// Issue #61: trim partition 1's History on the trio's node at `at` to `through`, as
+/// `admin trim-history` asks it ([`Msg::TrimHistory`]), stepping the trio until it answers.
+#[cfg(debug_assertions)]
+pub(super) fn trim(trio: &mut Trio, at: usize, through: u64) -> Result<Seq, String> {
+    let (reply, answer) = mpsc::channel();
+    trio.nodes[at]
+        .1
+        .send(Msg::TrimHistory {
+            partition: PartitionId(1),
+            through: Seq(through),
+            reply,
+        })
+        .expect("the node's mailbox");
+    trio.until("the trim answers", |_| answer.try_recv().ok())
+}
+
+/// Issue #61: the first rung of the R1 ladder `host` holds for partition 1, its primary's or
+/// its receiver's, or `None` when it holds neither or an empty one.
+pub(super) fn ladder_floor(host: &Host) -> Option<Seq> {
+    let p = PartitionId(1);
+    match host.replication.primary(host.node, p) {
+        Some(primary) => primary.tracker().history().floor(),
+        None => host
+            .replication
+            .receiver(host.node, p)
+            .and_then(|receiver| receiver.history().floor()),
+    }
+}
+
 /// Node 2's host over the engine at `path`, which a row filled first.
 pub(super) fn host_over(path: &std::path::Path, rt: &tokio::runtime::Runtime) -> Host {
     let engine = RocksEngine::open(path).expect("open engine");

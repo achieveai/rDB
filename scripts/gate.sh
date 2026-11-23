@@ -21,7 +21,7 @@
 #
 # Usage:
 #   scripts/gate.sh                                   fmt + deps + drift + purity + clippy + test
-#   scripts/gate.sh fmt|deps|drift|purity|lint|test   one stage
+#   scripts/gate.sh fmt|deps|drift|purity|scripts|lint|test  one stage
 #   scripts/gate.sh test -p config-engine --test m4_watch    extra args go to cargo
 #   scripts/gate.sh perf                              the wall-clock perf rows, one at a time
 
@@ -77,6 +77,16 @@ run_drift() { scripts/drift-check.sh; }
 # the reason the drift stage gives above — two copies of a rule drift apart.
 run_purity() { scripts/purity-check.sh; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
+# Tests of the repo's own scripts. scripts/thread-waits.py reads /proc and runs pgrep, so its
+# tests are Linux only; elsewhere (Git Bash on Windows) the stage says so and passes.
+run_scripts() {
+  echo "== scripts"
+  if [ "$(uname -s)" != Linux ]; then
+    echo "scripts: skipped thread-waits-test.py: it needs Linux /proc and pgrep"
+    return 0
+  fi
+  python3 -I scripts/thread-waits-test.py
+}
 # Every other stage builds with debug assertions on, so code that names a
 # `#[cfg(debug_assertions)]` item without the same cfg passes all of them and breaks a consumer's
 # release build. `Msg::Damage`'s arm in net/wire.rs did exactly that (found 2026-11-08). The
@@ -139,14 +149,15 @@ case "$stage" in
   drift) run_drift ;;
   purity) run_purity ;;
   lint)  run_lint ;;
+  scripts) run_scripts ;;
   release) run_release ;;
   test)  run_test "$@" ;;
   perf)  run_perf "$@" ;;
   # One stage per line, never an `&&` chain: bash ignores `set -e` inside one, so a failed
   # stage ended the chain and the script still printed "all OK" and exited 0, with no
   # clippy and no tests run. Observed 2026-10-01 with a drift failure.
-  all)   run_fmt; run_deps; run_drift; run_purity; run_lint; run_release; run_test ;;
-  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, release, test, perf or all)" >&2; exit 1 ;;
+  all)   run_fmt; run_deps; run_drift; run_purity; run_scripts; run_lint; run_release; run_test ;;
+  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, scripts, lint, release, test, perf or all)" >&2; exit 1 ;;
 esac
 
 echo "gate: $stage OK"

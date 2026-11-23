@@ -2555,6 +2555,15 @@ struct RouteStore {
     inner: config_testkit::MemStore,
     /// Reads of a `partitions/` key so far.
     reads: std::sync::atomic::AtomicU32,
+    /// Reads of a `nodes/` key so far (#83 B2).
+    node_reads: std::sync::atomic::AtomicU32,
+    /// `partitions/` and `nodes/` reads still to fail `Unavailable`, without reading (PR #159
+    /// review).
+    fail_partition_gets: std::sync::atomic::AtomicU32,
+    fail_node_gets: std::sync::atomic::AtomicU32,
+    /// While set, a read of this `nodes/` key waits at `node_gate` after it has read.
+    node_hold: Mutex<Option<String>>,
+    node_gate: tokio::sync::Semaphore,
     /// While set, a `partitions/` read waits at `gate` after it has read.
     hold: AtomicBool,
     gate: tokio::sync::Semaphore,
@@ -2577,10 +2586,44 @@ impl ConfigStore for RouteStore {
         'a: 'b,
         Self: 'b,
     {
+        let failed = || -> Reply<'b, config_core::GetResponse> {
+            Box::pin(std::future::ready(Err(ConfigError::Unavailable {
+                reason: "RouteStore: this read is scripted to fail".to_owned(),
+            })))
+        };
+        let take = |left: &std::sync::atomic::AtomicU32| {
+            let mut n = left.load(Ordering::SeqCst);
+            while n > 0 {
+                match left.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return true,
+                    Err(now) => n = now,
+                }
+            }
+            false
+        };
+        if request.key.starts_with(b"nodes/") {
+            self.node_reads.fetch_add(1, Ordering::SeqCst);
+            if take(&self.fail_node_gets) {
+                return failed();
+            }
+            let held = self.node_hold.lock().expect("node_hold").as_deref()
+                == Some(&*String::from_utf8_lossy(&request.key));
+            if !held {
+                return self.inner.get(request);
+            }
+            return Box::pin(async move {
+                let answer = self.inner.get(request).await;
+                let _permit = self.node_gate.acquire().await.expect("never closed");
+                answer
+            });
+        }
         if !request.key.starts_with(b"partitions/") {
             return self.inner.get(request);
         }
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if take(&self.fail_partition_gets) {
+            return failed();
+        }
         Box::pin(async move {
             let answer = self.inner.get(request).await;
             if self.hold.load(Ordering::SeqCst) {
@@ -2663,6 +2706,11 @@ fn route_db(rt: &tokio::runtime::Runtime) -> (Db, Arc<RouteStore>, std::sync::mp
     let store = Arc::new(RouteStore {
         inner: config_testkit::MemStore::new(),
         reads: std::sync::atomic::AtomicU32::new(0),
+        node_reads: std::sync::atomic::AtomicU32::new(0),
+        fail_partition_gets: std::sync::atomic::AtomicU32::new(0),
+        fail_node_gets: std::sync::atomic::AtomicU32::new(0),
+        node_hold: Mutex::new(None),
+        node_gate: tokio::sync::Semaphore::new(0),
         hold: AtomicBool::new(false),
         gate: tokio::sync::Semaphore::new(0),
         held: Mutex::new(held),
@@ -2990,5 +3038,637 @@ fn i79_a_lost_secondary_refuses_no_write_and_warns() {
         "{}",
         warns[0]
     );
+    db.shutdown();
+}
+
+// ---- #83 slice B2: `route` names the owner's address; #135: an undecodable record ----
+
+/// Write `node`'s `nodes/{id}` record as a declaration writes it (layout 1), or, with `app`,
+/// as the node rewrites it at open (layout 2).
+fn write_node(rt: &tokio::runtime::Runtime, store: &RouteStore, node: NodeId, app: Option<&str>) {
+    let record = NodeRecord {
+        node,
+        addr: format!("127.0.0.{}:7100", node.0),
+        machine: format!("m{}", node.0),
+    };
+    let body = app.map_or_else(|| record.encode(), |app| record.encode_with_app(app));
+    put_raw(rt, store, ControlKey::Node(node).encode(), body);
+}
+
+/// Put `value` at `key` as it is, and return the watch event that delivers it.
+fn put_raw(
+    rt: &tokio::runtime::Runtime,
+    store: &RouteStore,
+    key: String,
+    value: Bytes,
+) -> config_core::WatchItem {
+    let key = Bytes::from(key);
+    let written = rt
+        .block_on(store.inner.put(config_core::PutRequest {
+            key: key.clone(),
+            value: value.clone(),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the record is written");
+    config_core::WatchItem::Event(config_core::MutationEvent {
+        revision: written.revision,
+        key,
+        kind: config_core::MutationEventKind::Put {
+            value,
+            create_revision: 1,
+        },
+    })
+}
+
+/// own83_26 (#83 B2): `route` names the app address the owner registered in its `nodes/{id}`
+/// record, and the answer moves with the owner: once a change of partition 1's record is
+/// delivered, the next call names the new owner and its app address, never the old owner's. An
+/// owner whose record holds no app address (layout 1, as the declaration wrote it) and an owner
+/// with no record at all (a database formed in one process) answer none, and the rest of the
+/// answer still. `leader_of` of the partition answers what `route` does, and `partition_of`
+/// names the partition `route` does. Cut: the address read for a fixed node (node 1) rather
+/// than the record's owner, red at "moved". Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_26_route_names_the_owners_app_address_and_follows_the_owner() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(
+        &rt,
+        &store,
+        NodeId(1),
+        Some("https://gw-1.example:8443/sbx"),
+    );
+    write_node(&rt, &store, NodeId(3), Some("[::1]:9130"));
+    write_node(&rt, &store, NodeId(2), None);
+    let items = open_route_watch(&db, &store, 1);
+    let first = db.route(G1).expect("route answers");
+    assert_eq!(
+        first.app_address(),
+        Some("https://gw-1.example:8443/sbx"),
+        "{first:?}"
+    );
+    assert_eq!(db.partition_of(G1), first.partition);
+    assert_eq!(db.leader_of(first.partition).expect("leader_of"), first);
+
+    items
+        .send(Ok(write_route(&rt, &store, NodeId(3), 2)))
+        .expect("the watch is open");
+    let moved = route_until_read(&db, &store, 2, "delivered");
+    assert_eq!(
+        (moved.owner, moved.token, moved.app_address()),
+        (NodeId(3), token_at(2), Some("[::1]:9130")),
+        "moved"
+    );
+
+    items
+        .send(Ok(write_route(&rt, &store, NodeId(2), 3)))
+        .expect("the watch is open");
+    let bare = route_until_read(&db, &store, 3, "delivered again");
+    assert_eq!(
+        (bare.owner, bare.token, bare.app_address()),
+        (NodeId(2), token_at(3), None),
+        "layout 1: no app address, the rest of the answer still"
+    );
+
+    items
+        .send(Ok(write_route(&rt, &store, NodeId(4), 4)))
+        .expect("the watch is open");
+    let none = route_until_read(&db, &store, 4, "no record");
+    assert_eq!(
+        (none.owner, none.app_address()),
+        (NodeId(4), None),
+        "no record"
+    );
+    db.shutdown();
+}
+
+/// own83_25 (#83 B2): an owner restarted with a new app address is seen within one second,
+/// and no sooner reads cost more than one `nodes/` read. The record is rewritten under a cached
+/// answer: calls inside the second serve the old address with no node read; a call 1.05 s
+/// after the first read names the new one. The boundary is a literal second, the contract,
+/// not `APP_ADDR_REREAD_GAP`, so a slower gap goes red here at once instead of lengthening the
+/// wait. Cut: the gap 1000 times as long, red at "after a second" within ~1.1 s. Unit
+/// (~1.1 s: the second is wall time).
+#[config_log::retcd_test]
+fn own83_25_a_changed_app_address_is_seen_within_the_gap() {
+    const CONTRACT: Duration = Duration::from_secs(1);
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    let first_read = Instant::now();
+    let before = db.route(G1).expect("route answers");
+    assert_eq!(before.app_address(), Some("gw-1:8443"));
+    let node_reads = || store.node_reads.load(Ordering::SeqCst);
+    let read_once = node_reads();
+    assert_eq!(read_once, 1, "the first call read nodes/1");
+    write_node(&rt, &store, NodeId(1), Some("gw-1:9443"));
+    for _ in 0..20 {
+        assert_eq!(
+            db.route(G1).expect("route answers"),
+            before,
+            "inside the second"
+        );
+    }
+    assert_eq!(node_reads(), read_once, "one read per second");
+    std::thread::sleep((first_read + CONTRACT + Duration::from_millis(50)) - Instant::now());
+    let after = db.route(G1).expect("route answers");
+    assert_eq!(after.app_address(), Some("gw-1:9443"), "after a second");
+    db.shutdown();
+}
+
+/// Whether `refused` is the `UNAVAILABLE` a later call can fix.
+fn retryable_unavailable(refused: &ApiError) -> bool {
+    refused.kind == ErrorKind::Unavailable && refused.retry == RetryRule::BoundedJitter
+}
+
+/// own83_27 (#83 B2, PR #159 review): a cold `route` whose `partitions/1` read fails, twice,
+/// answers `UNAVAILABLE` (retry `BoundedJitter`) each time and caches nothing: each call reads
+/// again. Once the store answers, the next call names the owner and its app address, and only
+/// then is the answer cached (a further call reads nothing). Cut: `control_read`'s
+/// `Unavailable` arm answering `INCOMPATIBLE_VERSION` (retry `Quarantine`), red at the first
+/// failure. Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_27_a_failed_partition_read_is_unavailable_and_recovers() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    let reads = || store.reads.load(Ordering::SeqCst);
+    store.fail_partition_gets.store(2, Ordering::SeqCst);
+    for attempt in 1..=2 {
+        let refused = db.route(G1).expect_err("the read fails");
+        assert!(retryable_unavailable(&refused), "{attempt}: {refused}");
+        assert_eq!(reads(), attempt, "{attempt}: read again, nothing cached");
+    }
+    assert_eq!(
+        store.node_reads.load(Ordering::SeqCst),
+        0,
+        "no owner to read"
+    );
+    let route = db.route(G1).expect("the store answers again");
+    assert_eq!(
+        (route.owner, route.app_address()),
+        (NodeId(1), Some("gw-1:8443"))
+    );
+    assert_eq!(reads(), 3);
+    assert_eq!(db.route(G1).expect("cached"), route);
+    assert_eq!(reads(), 3, "the good answer is cached");
+    db.shutdown();
+}
+
+/// own83_28 (#83 B2, PR #159 review; SBX answer, 2026-11-20): a cached owner still reads its
+/// app address once the second is up, and that read can fail. The owner moved to a new
+/// address; after the second, two calls whose `nodes/1` read fails succeed with the owner, its
+/// token and the last good address, the stale one, with no `partitions/` read (the owner is
+/// cached) and nothing refreshed (each call reads `nodes/1` again). Each failure is logged
+/// `db_route_app_addr_unreadable` with `served: last_good`, at WARN. Then the store answers and
+/// the next call names the new address. Cuts: the failed read answering `None`, red at the
+/// first failure ("the last good address"); the failure refreshing the stamp, red at the second
+/// ("read again, nothing refreshed"); the warning logged at INFO, red at "WARN". Unit (~1.1 s: the second is wall time).
+#[config_log::retcd_test]
+fn own83_28_a_failed_address_read_of_a_cached_owner_serves_the_last_good_and_recovers() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    assert_eq!(
+        db.route(G1).expect("a route").app_address(),
+        Some("gw-1:8443")
+    );
+    write_node(&rt, &store, NodeId(1), Some("gw-1:9443"));
+    std::thread::sleep(Duration::from_millis(1_050));
+    let (partition_reads, node_reads) = (
+        store.reads.load(Ordering::SeqCst),
+        store.node_reads.load(Ordering::SeqCst),
+    );
+    store.fail_node_gets.store(2, Ordering::SeqCst);
+    for attempt in 1..=2 {
+        let served = db.route(G1).expect("a failed address read still answers");
+        assert_eq!(
+            (served.owner, served.token, served.app_address()),
+            (NodeId(1), token_at(1), Some("gw-1:8443")),
+            "{attempt}: the owner and token, with the last good address"
+        );
+        assert_eq!(
+            store.node_reads.load(Ordering::SeqCst),
+            node_reads + attempt,
+            "{attempt}: read again, nothing refreshed"
+        );
+    }
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_28_a_failed_address_read_of_a_cached_owner_serves_the_last_good_and_recovers",
+    );
+    let unreadable: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "db_route_app_addr_unreadable")
+        .collect();
+    assert_eq!(unreadable.len(), 2, "{unreadable:?}");
+    for line in &unreadable {
+        assert_eq!(
+            (&line["node"], &line["served"], &line["reason"]),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!("last_good"),
+                &serde_json::json!("Unavailable")
+            ),
+            "{line}"
+        );
+        assert_eq!(line["@l"], "Warning", "WARN: {line}");
+    }
+    let route = db.route(G1).expect("the store answers again");
+    assert_eq!(route.app_address(), Some("gw-1:9443"));
+    assert_eq!(
+        store.reads.load(Ordering::SeqCst),
+        partition_reads,
+        "the owner stayed cached throughout"
+    );
+    db.shutdown();
+}
+
+/// own83_29 (#83 B2, PR #159 review): concurrent callers whose cached address of one owner has
+/// expired share one `nodes/` read. Four threads route while node 1's read is held at a gate:
+/// within 300 ms no second `nodes/1` read starts, and meanwhile node 3's address is read and
+/// answered, so another owner never waits on node 1's read. Released, all four answer the new
+/// address, after exactly one read. Cut: the read in flight not shared (each caller reads), red
+/// at "one read" (4 reads held). Unit (~1.5 s: the second, and the 300 ms watch).
+#[config_log::retcd_test]
+fn own83_29_concurrent_address_refreshes_of_one_owner_share_one_read() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    write_node(&rt, &store, NodeId(3), Some("gw-3:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    db.route(G1).expect("a route");
+    write_node(&rt, &store, NodeId(1), Some("gw-1:9443"));
+    std::thread::sleep(Duration::from_millis(1_050));
+    let node_reads = || store.node_reads.load(Ordering::SeqCst);
+    let before = node_reads();
+    *store.node_hold.lock().expect("node_hold") = Some(ControlKey::Node(NodeId(1)).encode());
+    std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..4).map(|_| scope.spawn(|| db.route(G1))).collect();
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        while node_reads() == before {
+            assert!(Instant::now() < until, "no caller read nodes/1");
+            std::thread::yield_now();
+        }
+        let watch = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < watch {
+            assert_eq!(node_reads(), before + 1, "one read while it is held");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            db.app_address_of(NodeId(3)).expect("node 3 reads"),
+            Some("gw-3:8443".to_owned()),
+            "another owner does not wait on node 1's read"
+        );
+        store.node_gate.add_permits(100);
+        for caller in callers {
+            let route = caller.join().expect("a caller").expect("a route");
+            assert_eq!(route.app_address(), Some("gw-1:9443"));
+        }
+    });
+    assert_eq!(
+        node_reads(),
+        before + 2,
+        "one read of nodes/1, one of nodes/3"
+    );
+    db.shutdown();
+}
+
+/// A [`route_db`] whose node 1 answered `gw-1:8443` once and now holds `gw-1:9443`, with that
+/// answer's second up, so the next call reads `nodes/1` again; `read` is the `Db`'s read
+/// timeout (PR #159 review r2).
+fn route_db_expired(
+    rt: &tokio::runtime::Runtime,
+    read: Duration,
+) -> (Db, Arc<RouteStore>, WatchItems) {
+    let (mut db, store, _) = route_db(rt);
+    db.timeouts.read = read;
+    write_node(rt, &store, NodeId(1), Some("gw-1:8443"));
+    let items = open_route_watch(&db, &store, 1);
+    assert_eq!(
+        db.route(G1).expect("a route").app_address(),
+        Some("gw-1:8443")
+    );
+    write_node(rt, &store, NodeId(1), Some("gw-1:9443"));
+    std::thread::sleep(Duration::from_millis(1_050));
+    *store.node_hold.lock().expect("node_hold") = Some(ControlKey::Node(NodeId(1)).encode());
+    (db, store, items)
+}
+
+/// own83_31 (#83 B2, PR #159 review r2, T27): waiting for another caller's address read is
+/// inside the one read timeout a call has for the address, not added to it. Node 1's read is
+/// held past the read timeout (1 s); four callers route at once, twice: each answers within
+/// 1.75 s of its own start, under two read timeouts, where queueing read after read took one
+/// more timeout per caller ahead. Each answer names the last good address, `gw-1:8443`, since
+/// the read timed out (SBX answer, 2026-11-20). Then the hold is lifted and the next call names
+/// the new address. Cut: a waiter whose shared read failed reads again itself, red at the bound
+/// (the second caller ~2 s). Unit (~3.2 s: the second, and two held rounds of one read
+/// timeout).
+#[config_log::retcd_test]
+fn own83_31_waiting_for_a_held_address_read_is_within_one_read_timeout() {
+    const READ: Duration = Duration::from_secs(1);
+    let bound = READ + READ * 3 / 4;
+    let rt = runtime();
+    let (mut db, store, _items) = route_db_expired(&rt, READ);
+    for round in 1..=2 {
+        let answers: Vec<_> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let started = Instant::now();
+                        let answer = db.route(G1);
+                        (answer, started.elapsed())
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().expect("a caller"))
+                .collect()
+        });
+        for (answer, took) in &answers {
+            let served = answer
+                .as_ref()
+                .expect("a timed-out address read still answers");
+            assert_eq!(
+                (served.owner, served.app_address()),
+                (NodeId(1), Some("gw-1:8443")),
+                "{round}: the last good address"
+            );
+            assert!(
+                *took < bound,
+                "{round}: a caller took {took:?}, over one read timeout and its slack"
+            );
+        }
+    }
+    *store.node_hold.lock().expect("node_hold") = None;
+    store.node_gate.add_permits(100);
+    let route = db.route(G1).expect("recovered");
+    assert_eq!(route.app_address(), Some("gw-1:9443"));
+    db.shutdown();
+}
+
+/// own83_32 (#83 B2, PR #159 review r2, T30): a slow address read that succeeds is shared with
+/// the callers already waiting for it, even though its pre-read stamp has expired by the time
+/// it answers. Four callers route while node 1's read is held for more than the second
+/// (the read timeout is 3 s); every later `nodes/` read is then scripted to fail, and the held
+/// read is let go. All four name the new address, after one read. A call after that finds the
+/// answer stamped more than a second ago, so it reads again (the pre-read stamp stays the
+/// cache's), and that read fails: the call answers the shared read's address as the last good
+/// one (SBX answer, 2026-11-20). Cut: a waiter ignores the shared success and looks at the
+/// cache again, red at "one read for the four" (each reads). Unit (~2.6 s).
+#[config_log::retcd_test]
+fn own83_32_a_slow_address_read_that_succeeds_is_shared_with_its_waiters() {
+    let rt = runtime();
+    let (mut db, store, _items) = route_db_expired(&rt, Duration::from_secs(3));
+    let node_reads = || store.node_reads.load(Ordering::SeqCst);
+    let before = node_reads();
+    std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..4).map(|_| scope.spawn(|| db.route(G1))).collect();
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        while node_reads() == before {
+            assert!(Instant::now() < until, "no caller read nodes/1");
+            std::thread::yield_now();
+        }
+        let read_began = Instant::now();
+        std::thread::sleep(APP_ADDR_REREAD_GAP + Duration::from_millis(300));
+        assert!(read_began.elapsed() > Duration::from_secs(1));
+        store.fail_node_gets.store(100, Ordering::SeqCst);
+        store.node_gate.add_permits(100);
+        for caller in callers {
+            let route = caller.join().expect("a caller");
+            assert_eq!(
+                route.as_ref().map(RouteInfo::app_address),
+                Ok(Some("gw-1:9443")),
+                "shared"
+            );
+        }
+    });
+    assert_eq!(node_reads(), before + 1, "one read for the four");
+    let later = db
+        .route(G1)
+        .expect("a later call reads again, and that read fails");
+    assert_eq!(later.app_address(), Some("gw-1:9443"), "the last good");
+    assert_eq!(node_reads(), before + 2, "the pre-read stamp has expired");
+    db.shutdown();
+}
+
+/// own83_33 (#83 B2, SBX answer, 2026-11-20): an owner whose address no read of this `Db` has
+/// returned yet, and whose read fails, gives the owner and token with no address, twice, each
+/// call reading `nodes/1` again, and logged `db_route_app_addr_unreadable` with `served: none`,
+/// at WARN. The next read that succeeds names the address. Cuts: the error returned again, red
+/// at the first failure (as are own83_31 and own83_32); the warning logged at INFO, red at
+/// "WARN". Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_33_a_failed_first_address_read_gives_no_address_and_recovers() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let _items = open_route_watch(&db, &store, 1);
+    store.fail_node_gets.store(2, Ordering::SeqCst);
+    for attempt in 1..=2 {
+        let served = db.route(G1).expect("a failed address read still answers");
+        assert_eq!(
+            (served.owner, served.token, served.app_address()),
+            (NodeId(1), token_at(1), None),
+            "{attempt}: no read has succeeded"
+        );
+        assert_eq!(
+            store.node_reads.load(Ordering::SeqCst),
+            attempt,
+            "{attempt}: read again"
+        );
+    }
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_33_a_failed_first_address_read_gives_no_address_and_recovers",
+    );
+    let unreadable: Vec<_> = lines
+        .iter()
+        .filter(|line| line["@m"] == "db_route_app_addr_unreadable")
+        .collect();
+    assert_eq!(unreadable.len(), 2, "{unreadable:?}");
+    for line in &unreadable {
+        assert_eq!(
+            (&line["node"], &line["served"]),
+            (&serde_json::json!(1), &serde_json::json!("none")),
+            "{line}"
+        );
+        assert_eq!(line["@l"], "Warning", "WARN: {line}");
+    }
+    let route = db.route(G1).expect("the store answers again");
+    assert_eq!(route.app_address(), Some("gw-1:8443"), "recovered");
+    db.shutdown();
+}
+
+/// own83_34 (#83 B2, PR #159 review r3, T46): a reader dropped before it finishes, as a panic
+/// mid-read drops it, still ends its read. A flight is joined by hand: node 1's slot holds a
+/// read in flight and its [`AddrReader`], and a caller waits on it (the read timeout is 10 s).
+/// Dropping the reader answers that caller `UNAVAILABLE` (retry `BoundedJitter`) at once, well
+/// inside its timeout, and leaves no read in flight in the slot. The next call reads `nodes/1`
+/// itself and names its address. Cut: `AddrReader`'s `Drop` does not call `end`, red at
+/// "at once" (the caller waits out its 10 s). Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_34_a_reader_dropped_unfinished_ends_its_read() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    db.timeouts.read = Duration::from_secs(10);
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    let read = Arc::new(AddrRead::default());
+    lock(&db.route.addrs).entry(NodeId(1)).or_default().reading = Some(Arc::clone(&read));
+    let reader = AddrReader {
+        route: &db.route,
+        node: NodeId(1),
+        read: Arc::clone(&read),
+        finished: false,
+    };
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let started = Instant::now();
+            (db.app_address_of(NodeId(1)), started)
+        });
+        // The slot, the reader, this row and the waiter each hold the read.
+        let until = Instant::now() + crate::host::test_patience(Duration::from_secs(5));
+        while Arc::strong_count(&read) < 4 {
+            assert!(Instant::now() < until, "the caller never joined the read");
+            std::thread::yield_now();
+        }
+        drop(reader);
+        let (answer, started) = waiter.join().expect("the caller");
+        let refused = answer.expect_err("the read ended without an answer");
+        assert!(retryable_unavailable(&refused), "{refused}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "at once: {:?}",
+            started.elapsed()
+        );
+    });
+    assert!(
+        lock(&db.route.addrs)[&NodeId(1)].reading.is_none(),
+        "no read left in flight"
+    );
+    assert_eq!(
+        store.node_reads.load(Ordering::SeqCst),
+        0,
+        "nothing read yet"
+    );
+    assert_eq!(
+        db.app_address_of(NodeId(1)).expect("a healthy read"),
+        Some("gw-1:8443".to_owned())
+    );
+    assert_eq!(store.node_reads.load(Ordering::SeqCst), 1, "read itself");
+    db.shutdown();
+}
+
+/// own83_30 (#83 B2, PR #159 review): an app address is opaque and may carry a credential, so
+/// no log line holds it: `route` and `leader_of` of an owner whose address holds a synthetic
+/// credential return it byte for byte, while every line this row logged lacks it. The address
+/// read is logged, with its length, at DEBUG (PR #159 review r3, T49): a routine read is
+/// neither lifecycle nor mutation. Cut: `db_route_app_addr_read` logs `app = %app`, red. Cut:
+/// the read logged at INFO again, red at "DEBUG".
+/// Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_30_no_log_line_holds_an_app_address() {
+    const SECRET: &str = "https://svc:pw-SYNTHETIC-7f3a9c@gw-1.example:8443/sbx";
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    write_node(&rt, &store, NodeId(1), Some(SECRET));
+    let route = db.route(G1).expect("a route");
+    assert_eq!(route.app_address(), Some(SECRET));
+    let leader = db.leader_of(route.partition).expect("leader_of");
+    assert_eq!(leader.app_address(), Some(SECRET));
+    let lines = config_testkit::logs::lines_for_current_test(
+        module_path!(),
+        "own83_30_no_log_line_holds_an_app_address",
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["@m"] == "db_route_app_addr_read" && line["app_len"] == SECRET.len()),
+        "the address read is logged with its length"
+    );
+    for line in lines
+        .iter()
+        .filter(|line| line["@m"] == "db_route_app_addr_read")
+    {
+        assert_eq!(line["@l"], "Debug", "DEBUG: {line}");
+    }
+    for line in &lines {
+        assert!(!line.to_string().contains("pw-SYNTHETIC-7f3a9c"), "{line}");
+    }
+    db.shutdown();
+}
+
+/// own83_24 (#83, SBX's `leader_of`): a partition the database does not have is refused as
+/// `INVALID_ARGUMENT`, without a read: partition 0 and one past the count. Cut: the range check
+/// removed, red: partition 2's absent record answers `UNAVAILABLE`. Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own83_24_leader_of_a_partition_the_database_lacks_is_invalid() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    let count = db.partition_count();
+    for partition in [PartitionId(0), PartitionId(count + 1)] {
+        let refused = db.leader_of(partition).expect_err("no such partition");
+        assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused}");
+    }
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0, "nothing was read");
+    db.shutdown();
+}
+
+/// own135_1 (#135): a record `route` cannot decode answers `INCOMPATIBLE_VERSION` with retry
+/// `Quarantine` and an upgrade step, not `UNAVAILABLE` with "try again": partition 1's record
+/// in a layout this build does not read, and then a readable one whose owner's `nodes/{id}`
+/// record does not decode. A record that is only absent stays `UNAVAILABLE`, which a later
+/// call can fix. Cut: the undecodable arm mapped back to `UNAVAILABLE`, red at each kind.
+/// Unit (~0.1 s).
+#[config_log::retcd_test]
+fn own135_1_an_undecodable_record_is_an_incompatible_version() {
+    let rt = runtime();
+    let (mut db, store, _) = route_db(&rt);
+    let incompatible = |what: &str| {
+        let refused = db.route(G1).expect_err(what);
+        assert_eq!(
+            refused.kind,
+            ErrorKind::IncompatibleVersion,
+            "{what}: {refused}"
+        );
+        assert_eq!(refused.retry, RetryRule::Quarantine, "{what}: {refused}");
+        let text = refused.to_string();
+        assert!(text.contains("retrying will not help"), "{what}: {text}");
+        assert!(!text.contains("try again"), "{what}: {text}");
+    };
+
+    let key = ControlKey::Partition(PARTITION).encode();
+    put_raw(
+        &rt,
+        &store,
+        key.clone(),
+        Bytes::from_static(&[0xEE, 1, 2, 3]),
+    );
+    incompatible("a partition record of a newer layout");
+
+    write_route(&rt, &store, NodeId(1), 1);
+    put_raw(
+        &rt,
+        &store,
+        ControlKey::Node(NodeId(1)).encode(),
+        Bytes::from_static(&[0xEE]),
+    );
+    incompatible("the owner's node record of a newer layout");
+
+    write_node(&rt, &store, NodeId(1), Some("gw-1:8443"));
+    assert!(db.route(G1).is_ok(), "both records decode");
+    rt.block_on(store.inner.delete(config_core::DeleteRequest {
+        key: Bytes::from(key),
+        expected_mod_revision: None,
+        dedup: None,
+    }))
+    .expect("deleted");
+    let absent = db.route(G1).expect_err("absent");
+    assert_eq!(absent.kind, ErrorKind::Unavailable, "{absent}");
     db.shutdown();
 }

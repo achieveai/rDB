@@ -311,9 +311,11 @@ pub struct ClusterConfig {
     pub recovery_epoch: RecoveryEpoch,
     /// Per-node storage fault injectors. A node absent from the map gets [`NoFaults`].
     pub faults: BTreeMap<NodeId, Arc<dyn FaultInjector>>,
-    /// Wraps `ensure_linearizable` on every read.
+    /// Wraps `ensure_linearizable` on every read. Defaults to [`DEFAULT_CALL_TIMEOUT`] stretched
+    /// by `RETCD_TEST_DEADLINE_SCALE`; a row that needs a fixed budget sets it with
+    /// [`ClusterBuilder::timeouts`] and says why.
     pub read_timeout: Duration,
-    /// Wraps `client_write` on every mutation.
+    /// Wraps `client_write` on every mutation. Defaults like [`Self::read_timeout`].
     pub write_timeout: Duration,
     /// How often each node polls its gossip source.
     pub gossip_poll: Duration,
@@ -409,6 +411,20 @@ impl std::fmt::Debug for ClusterConfig {
     }
 }
 
+/// A node's read and write timeout at `RETCD_TEST_DEADLINE_SCALE` 1. Short enough that a call
+/// against an unreachable quorum finishes well inside the 10 s per-test budget, long enough that
+/// a healthy 3-node write never races it.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// [`DEFAULT_CALL_TIMEOUT`] stretched by [`crate::poll::deadline_scale`], like every other
+/// deadline the gate scales (issue #160). On a loaded host the whole test process can stall for
+/// seconds: m4_76 logged nothing from any thread for 2.36 s, re-elected, and a put then ran out a
+/// fixed 2 s write budget. The scale stretches how long a call waits, never a Raft timer, so a row
+/// still tests the real protocol.
+fn scaled_call_timeout() -> Duration {
+    DEFAULT_CALL_TIMEOUT * crate::poll::deadline_scale()
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -425,10 +441,8 @@ impl Default for ClusterConfig {
             cluster_id: ClusterId::from_bytes([7u8; 16]),
             recovery_epoch: RecoveryEpoch(1),
             faults: BTreeMap::new(),
-            // Short enough that a call against an unreachable quorum finishes well inside the
-            // 10 s per-test budget, long enough that a healthy 3-node write never races it.
-            read_timeout: Duration::from_secs(2),
-            write_timeout: Duration::from_secs(2),
+            read_timeout: scaled_call_timeout(),
+            write_timeout: scaled_call_timeout(),
             gossip_poll: Duration::from_millis(100),
             // Every ceiling off: the journal grows for the length of a test and nothing
             // deletes an event a row has not finished asserting on.

@@ -176,6 +176,29 @@ the copy is walked by ordinary catch-up. Rows: `m7b_123_historical_envelopes_rea
 `h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine`, and the simulator's
 `m10_d3_a_copy_behind_two_writeless_reopens_catches_up`.
 
+**Amended by issue #61 (History trim), 2026-11-20: the ladder mirrors `TrimFloor`, inclusive,
+and the once-per-generation refill is removed.** A trimmed lineage keeps History from its floor F,
+the record at F included (ADR-rdb-0027, spec §4.1). Every R1 ladder, primary and receiver, and
+every ladder the host keeps, holds a rung at each seq from F to its head, none below, and no
+`(0, ROOT)` once F is above 0 (`DigestLadder::trim_below`, `Replication::trim_history`). Below the
+head the ladder is dense from F, not a sparse stride (§3). The host trims R1's ladders first, then
+the engine, in one step, and after a trim, a restore or a `Recovered` it cuts any side still
+holding a rung below F (`Host::align_ladders`). `restore_history` on both sides takes a ladder
+dense from its first rung. So an ACK or a `NEED_PREFIX` at or above F finds its rung. Below F the
+engine cannot serve the record either, so the answer is a state snapshot (spec §10.1). A
+`Recovered` whose cutoff is below the floor anchors the receiver at the root
+(`NeedPrefix{0, ROOT}`) instead of answering `InvalidArgument`. The refill "once per generation"
+above is gone, with `Host::primary_ladders` and `snapshot_catchup_unservable`. Now
+`SnapshotCatchupRequired` refills the primary's ladder from its engine only when that ladder is
+not dense from the engine's floor to its head; a refill is never deduplicated, and the next ask
+reaches the transfer branch. A dense ladder opens a snapshot transfer. Rows:
+`t61_ack_below_floor_is_unverifiable_and_asks_snapshot`, `t61_ack_at_floor_counts`,
+`t61_need_prefix_zero_after_trim_asks_snapshot`,
+`t61_recovered_cutoff_below_floor_anchors_at_root`,
+`t61_ladder_dense_needs_every_rung_from_the_engine_floor`, and the host's
+`h2_a_snapshot_catch_up_refills_a_thin_ladder_then_opens_a_transfer`, which replaces
+`h2_a_snapshot_catch_up_is_served_once_from_the_primarys_engine`.
+
 **Amended 2026-11-11 (issue #105 unit 2, architect section 15.3; amends K-B-37 and A-R223):
 historical at or below a kept plan's cutoff.** Adoption breaks the floor rule's premise. A copy
 that adopts a live tail holds records stamped by the last writable generation above the prior

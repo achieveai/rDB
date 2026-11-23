@@ -103,7 +103,9 @@ pub fn check_listen(addr: &str) -> Result<SocketAddr, String> {
 #[must_use]
 pub const fn code_for(kind: ErrorKind) -> Code {
     match kind {
-        ErrorKind::InvalidArgument | ErrorKind::CrossAffinity => Code::InvalidArgument,
+        ErrorKind::InvalidArgument | ErrorKind::CrossAffinity | ErrorKind::TooLarge => {
+            Code::InvalidArgument
+        }
         ErrorKind::Overloaded => Code::ResourceExhausted,
         ErrorKind::UnknownOutcome => Code::Unknown,
         ErrorKind::ConditionFailed
@@ -154,6 +156,7 @@ pub const fn wire_kind(kind: ErrorKind) -> pb::ErrorKind {
         ErrorKind::UploadChunkConflict => W::UploadChunkConflict,
         ErrorKind::CorruptBlob => W::CorruptBlob,
         ErrorKind::DurabilityUnconfirmed => W::DurabilityUnconfirmed,
+        ErrorKind::TooLarge => W::TooLarge,
     }
 }
 
@@ -176,15 +179,23 @@ pub const fn wire_retry(rule: RetryRule) -> pb::RetryRule {
 /// `error`'s text for an app on the wire: `NAME (detail; next: step)`, with the step from
 /// [`wire_step`] in place of the embedded API's, which names Rust calls (`Db::status`,
 /// `Db::resend`) an app in another language has not got. When the detail already ends with its
-/// own step ([`ApiError::next_step`] is `None`), the text is `error`'s `Display` unchanged.
+/// own step ([`ApiError::next_step`] is `None`), the text is `error`'s `Display` unchanged. A
+/// host fault ([`ApiError::is_host_fault`]) takes the `NotWired` step whatever its kind.
 #[must_use]
 pub fn wire_message(error: &ApiError) -> String {
+    // #170 review r4: a host fault takes the `NotWired` step whatever its kind and retry rule, as
+    // `ApiError::next_step` does: typed damage at the node is not the app's to repair.
+    let retry = if error.is_host_fault() {
+        RetryRule::NotWired
+    } else {
+        error.retry
+    };
     match error.next_step() {
         Some(_) => format!(
             "{} ({}; next: {})",
             error.name(),
             error.detail,
-            wire_step(error.kind, error.retry, error.no_mutation)
+            wire_step(error.kind, retry, error.no_mutation)
         ),
         None => error.to_string(),
     }
@@ -308,6 +319,10 @@ pub const fn wire_step(kind: ErrorKind, retry: RetryRule, no_mutation: bool) -> 
         ErrorKind::CorruptBlob => "write the blob again",
         ErrorKind::DurabilityUnconfirmed => {
             "the barrier wrote nothing and says nothing about the write: wait for it again"
+        }
+        ErrorKind::TooLarge => {
+            "make it smaller: the message names the limit, the size and the maximum; the same \
+             request fails the same way"
         }
     }
 }
@@ -617,11 +632,17 @@ where
     })
 }
 
+/// The target of `rdb_server_write`, one debug line per landed write (#158), so a filter can
+/// turn on that line alone: `RUST_LOG=info,rdb_server::write=debug`.
+pub const WRITE_LOG_TARGET: &str = "rdb_server::write";
+
 /// `ok` on the wire, logged as `rdb_server_write` on the blocking pool, where it is written
-/// even when the caller has gone (cs-tester D2).
+/// even when the caller has gone (cs-tester D2). One per write, so debug (#158); the call's
+/// `rdb_server_call` line at info carries its outcome and request id.
 fn logged_write(method: &'static str, ok: &PutOk) -> pb::WriteReply {
     let reply = write_reply(ok);
-    tracing::info!(
+    tracing::debug!(
+        target: WRITE_LOG_TARGET,
         method,
         request_id = reply.request_id,
         generation = reply.generation,

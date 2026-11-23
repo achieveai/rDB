@@ -1,4 +1,5 @@
 using System.Reflection;
+using Grpc.Core;
 using Google.Protobuf.Reflection;
 using Pb = Rdb.V1;
 
@@ -41,6 +42,7 @@ public class WireTableTests
     [InlineData(20, "UPLOAD_CHUNK_CONFLICT", RdbErrorKind.UploadChunkConflict)]
     [InlineData(21, "CORRUPT_BLOB", RdbErrorKind.CorruptBlob)]
     [InlineData(22, "DURABILITY_UNCONFIRMED", RdbErrorKind.DurabilityUnconfirmed)]
+    [InlineData(23, "TOO_LARGE", RdbErrorKind.TooLarge)]
     public void Each_wire_kind_number_is_its_proto_kind(int wire, string protoName, RdbErrorKind kind)
     {
         Assert.Equal(protoName, ProtoName<Pb.ErrorKind>(wire));
@@ -62,11 +64,36 @@ public class WireTableTests
         Assert.Equal(rule, RdbErrors.Retry(new Pb.RdbError { Retry = (Pb.RetryRule)wire }));
     }
 
+    /// <summary>
+    /// Issue #61 A8c: a write refused in the read-only window while a copy is rebuilt. RECOVERY_READ_ONLY with
+    /// retry_after_ms 5000 is RetryAfter 5 s, NoMutation, and retryable as a new write. The 5 s is a poll hint,
+    /// not an estimate of when writes resume.
+    /// </summary>
+    [Fact]
+    public void A_rebuild_window_refusal_waits_five_seconds_and_may_be_sent_again()
+    {
+        var d = new Pb.RdbError
+        {
+            Kind = Pb.ErrorKind.RecoveryReadOnly,
+            KindName = "RECOVERY_READ_ONLY",
+            Retry = Pb.RetryRule.RetryAfterRecovery,
+            NoMutation = true,
+            RetryAfterMs = 5000,
+        };
+        var e = RdbErrors.Map(new RpcException(new Status(StatusCode.Unavailable, "read-only")), d, isWrite: true);
+        Assert.IsNotType<RdbUnknownOutcomeException>(e);
+        Assert.Equal(RdbErrorKind.RecoveryReadOnly, e.Kind);
+        Assert.Equal(RdbRetry.RetryAfterRecovery, e.Retry);
+        Assert.True(e.NoMutation);
+        Assert.Equal(TimeSpan.FromSeconds(5), e.RetryAfter);
+        Assert.True(RdbErrors.MayRetry(d, isWrite: true));
+    }
+
     [Fact]
     public void The_tables_list_every_kind_and_rule()
     {
-        Assert.Equal(23, Enum.GetValues<RdbErrorKind>().Length); // 22 kinds and Unrecognized
-        Assert.Equal(23, Enum.GetValues<Pb.ErrorKind>().Length);
+        Assert.Equal(24, Enum.GetValues<RdbErrorKind>().Length); // 23 kinds and Unrecognized
+        Assert.Equal(24, Enum.GetValues<Pb.ErrorKind>().Length);
         Assert.Equal(9, Enum.GetValues<RdbRetry>().Length);
         Assert.Equal(9, Enum.GetValues<Pb.RetryRule>().Length);
     }

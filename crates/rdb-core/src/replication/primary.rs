@@ -18,6 +18,12 @@
 //! predicate (B-R48a F2), and when control re-announces its copy at a new node or boot
 //! (M7B-150). A reply from a diverged copy reaches no cursor.
 //!
+//! A request `ack_ladder` makes starts or re-arms a catching-up cursor: an ACK below the ladder
+//! answers `SnapshotCatchupRequired`, and `Primary::await_snapshot` makes that copy's cursor
+//! wait for the snapshot, so the copy's ACK at the head after the install reports
+//! `CopyCaughtUp` (issue #61, lead ruling 2026-11-22). The cursor is fresh — no mark, nothing in
+//! flight — so a request after `Recovered` keeps B-R48 ruling 6.
+//!
 //! One ACK the tracker drops still reaches a cursor (lead ruling B-R58c): below a recovery
 //! cutoff a built primary holds no rungs, so a copy walked up from the root sends ACKs the
 //! ladder can neither verify nor refute. When such an ACK names exactly the record the copy's
@@ -252,6 +258,17 @@ impl Primary {
         self.tracker.restore_history(rungs)
     }
 
+    /// Trim the tracker's ladder to the host's History floor (issue #61): see
+    /// [`ProgressTracker::trim_history`]. A cursor reads the ladder as an argument, so it sees
+    /// the floor on its next outcome.
+    ///
+    /// # Errors
+    ///
+    /// What [`ProgressTracker::trim_history`] refuses.
+    pub fn trim_history(&mut self, seq: Seq, digest: Digest) -> Result<(), RdbError> {
+        self.tracker.trim_history(seq, digest)
+    }
+
     /// The keepalive version armed now, while admission is rejected.
     #[must_use]
     pub const fn keepalive(&self) -> Option<TimerVersion> {
@@ -325,6 +342,21 @@ impl Primary {
                 let (admitted, mut effects) = self.tracker.ack_ladder(from, &ack, tick);
                 if let Some(copy) = admitted.filter(|copy| self.cursors.contains_key(copy)) {
                     effects.extend(self.drive(copy, AppendOutcome::Accepted(ack)));
+                }
+                // Issue #61: the ladder asked for a snapshot with no cursor behind it (an
+                // ACK it no longer holds). Start one, or the re-seed's ACK reaches none and the
+                // transfer is never released `caught_up`. The tracker's request stands.
+                let asked: Vec<CopyId> = effects
+                    .iter()
+                    .filter_map(|effect| match effect {
+                        EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+                            copy, ..
+                        }) => Some(*copy),
+                        _ => None,
+                    })
+                    .collect();
+                for copy in asked {
+                    let _request = self.await_snapshot(copy);
                 }
                 effects
             }
@@ -787,6 +819,31 @@ impl Primary {
         self.tracker.history().lookup(at, ack.digest_at_buffered) == DigestLookup::NotRetained
     }
 
+    /// Issue #61 (lead ruling 2026-11-22): a snapshot of `copy` is asked for at the head,
+    /// with `copy`'s cursor started, or re-armed, catching up and with nothing in flight
+    /// ([`CatchupCursor::await_snapshot`]). So every `SnapshotCatchupRequired` has a cursor
+    /// behind it, and the copy's ACK at the head after the install ends it with
+    /// `CopyCaughtUp`, which is what releases the transfer. Logged `r1.snapshot_cursor_awaiting`.
+    pub(crate) fn await_snapshot(&mut self, copy: CopyId) -> EffectKind {
+        let head = self.tracker.head();
+        let started = !self.cursors.contains_key(&copy);
+        self.cursors
+            .entry(copy)
+            .or_insert_with(|| CatchupCursor::new(copy))
+            .await_snapshot();
+        tracing::info!(
+            partition = self.tracker.partition().0,
+            copy = copy.0,
+            head = head.0,
+            started,
+            "r1.snapshot_cursor_awaiting"
+        );
+        EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+            copy,
+            barrier: head,
+        })
+    }
+
     /// The node and boot the tracker holds for `copy`: which incarnation of the copy it is.
     fn incarnation(&self, copy: CopyId) -> Option<(NodeId, BootId)> {
         self.tracker.peer(copy).map(|peer| (peer.node, peer.boot))
@@ -837,7 +894,9 @@ impl Primary {
     }
 }
 
-/// `Busy` and `AlreadyHave` may update a running cursor but never start one (B-R48a F1).
+/// `Busy` and `AlreadyHave` may update a running cursor but never start one (B-R48a F1). The
+/// other start outside a reply's cursor is a request `ack_ladder` makes
+/// (`Primary::await_snapshot`, issue #61 lead ruling 2026-11-22).
 const fn updates_only(outcome: AppendOutcome) -> bool {
     matches!(
         outcome,

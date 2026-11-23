@@ -1424,3 +1424,220 @@ fn m10_s2_an_empty_dedup_trim_does_not_count_as_synced() {
         "an empty trim is not counted"
     );
 }
+
+// Issue #61 A2: a copied inherit from a trimmed parent is bounded by its floor.
+
+/// A floor at `seq` whose root is the lineage root.
+const fn t61_floor(seq: u64) -> rdb_storage::TrimFloor {
+    rdb_storage::TrimFloor {
+        seq: Seq(seq),
+        root_base: Seq::ZERO,
+        root_digest: Digest::ROOT,
+    }
+}
+
+/// The batch for record `seq` of `(P, G1)`, chained from `prev`, whose envelope writes exactly
+/// `mutations` (no dedup row of its own), as a late write that only rewrites keys would.
+fn rewrite_batch(
+    like: &CanonicalHistory,
+    seq: u64,
+    prev: Digest,
+    mutations: Vec<Write>,
+) -> rdb_core::contracts::storage::Batch {
+    let template = like.batch(1);
+    let record = template
+        .writes
+        .iter()
+        .find(|w| w.ns == Namespace::History)
+        .and_then(|w| w.value.clone())
+        .expect("a canonical history record");
+    let mut envelope =
+        rdb_core::contracts::envelope::ReplicationEnvelope::decode(&record).expect("decode");
+    envelope.header.seq = Seq(seq);
+    envelope.prev_digest = prev;
+    envelope.mutations = mutations;
+    envelope.record_digest = envelope.compute_record_digest().expect("digest");
+    let mut progress = seq.to_le_bytes().to_vec();
+    progress.extend_from_slice(&envelope.record_digest.0);
+    let mut writes = envelope.mutations.clone();
+    writes.push(Write {
+        ns: Namespace::History,
+        key: Bytes::copy_from_slice(&seq.to_be_bytes()),
+        value: Some(envelope.encode().expect("encode")),
+    });
+    writes.push(Write {
+        ns: Namespace::Progress,
+        key: Bytes::from_static(PROGRESS_KEY),
+        value: Some(Bytes::from(progress)),
+    });
+    rdb_core::contracts::storage::Batch {
+        seq: Seq(seq),
+        writes,
+        ..template.clone()
+    }
+}
+
+/// g1 holds 1..=10 and a late write at 11 that rewrites k and the dedup row seq 6 wrote, both
+/// with after-images at or above F = 6. Returns record 11's batch.
+fn late_rewrite(engine: &mut RocksEngine) -> rdb_core::contracts::storage::Batch {
+    let g1 = write(engine, G1, 10);
+    let row6 = g1
+        .batch(6)
+        .writes
+        .iter()
+        .find(|w| w.ns == Namespace::Dedup)
+        .cloned()
+        .expect("seq 6's dedup row");
+    let k = scoped_key(TenantId(1), AffinityId(1), b"k");
+    let late = rewrite_batch(
+        &g1,
+        11,
+        g1.digest(10),
+        vec![
+            Write {
+                ns: Namespace::User,
+                key: k,
+                value: Some(Bytes::copy_from_slice(&11_u64.to_be_bytes())),
+            },
+            row6,
+        ],
+    );
+    engine.commit(late.clone()).expect("commit the late write");
+    late
+}
+
+/// A copied inherit from a parent trimmed at F = 6, cut at a late write that only rewrites keys
+/// whose after-images are at or above F (k at 10, seq 6's dedup row at exactly 6): `Copied`,
+/// with the same state as the same copy made with no trim. Red if the backward scan stops
+/// before the record at F (seq 6's row is then still open and refused).
+#[retcd_test]
+fn t61_copied_inherit_after_trim_rewrites_only() {
+    let dir = data_dir("t61-rewrite-only");
+    let state = |engine: &RocksEngine| -> Vec<(Namespace, Bytes, Bytes, Version)> {
+        engine
+            .snapshot(P, G2, SnapshotHandle(1))
+            .expect("snapshot")
+            .entries()
+            .expect("entries")
+            .into_iter()
+            .map(|(ns, key, value, version, _)| (ns, key, value, version))
+            .collect()
+    };
+    let mut whole = RocksEngine::open(dir.join("whole")).expect("open");
+    late_rewrite(&mut whole);
+    assert!(matches!(
+        whole.inherit(P, G1, G2, Seq(10)),
+        Ok(Inherited::Copied { .. })
+    ));
+
+    let mut trimmed = RocksEngine::open(dir.join("trimmed")).expect("open");
+    late_rewrite(&mut trimmed);
+    trimmed
+        .stage_trim_history(P, G1, t61_floor(6))
+        .expect("trim at 6");
+    assert!(matches!(
+        trimmed.inherit(P, G1, G2, Seq(10)),
+        Ok(Inherited::Copied { .. })
+    ));
+    assert_eq!(state(&trimmed), state(&whole), "the copy as of base 10");
+    verify_lineage(&trimmed, P, G2).expect("g2 verifies from g1's floor");
+}
+
+/// A copied inherit from a parent trimmed at F = 6, cut at a late write that **creates** a key
+/// (canonical record 11's own dedup row): its after-image below F is gone, so the copy is
+/// refused `below_floor:5` and nothing is written. A base below F is refused at the base. Red if
+/// the scan crosses F (`history:5`), or reads a missing record as an absent key (`Copied`).
+#[retcd_test]
+fn t61_copied_inherit_after_trim_refuses_a_created_key() {
+    let dir = data_dir("t61-created-key");
+    let db = dir.join("db");
+    let mut engine = RocksEngine::open(&db).expect("open");
+    write(&mut engine, G1, 11);
+    engine
+        .stage_trim_history(P, G1, t61_floor(6))
+        .expect("trim at 6");
+    let before = dumped(&db);
+    for (base, at) in [(10, "below_floor:5"), (4, "below_floor:4")] {
+        assert_eq!(
+            engine.inherit(P, G1, G2, Seq(base)),
+            Err(InheritError::HistoryMissing { at: at.to_string() }),
+            "base {base}"
+        );
+    }
+    assert_eq!(engine.staging(P, G2), None, "no copy was staged");
+    assert_eq!(dumped(&db), before, "a refused copy wrote something");
+}
+
+/// #170 review r3/r4 (thread 4654331883): a lineage's history floor and the dev tool
+/// `drop_history` see only what its chain reaches. G2 inherits G1 at base 2 (copied), so it
+/// reaches G1's records 1..=2 and holds its own 3..=5; G1's records 3..=10 are G1's.
+/// - The floor is 1 (G1's record 1, within reach).
+/// - Dropping 0..8 through G2 deletes 5 records (G1's 1..=2 and G2's 3..=5), not G1's 3..=7.
+/// - The floor is then G2's applied head plus one, 6, not G1's record 3, and stays 6 once G2
+///   appends seq 6.
+///
+/// Cuts: `history_floor` ignores the reach, red (floor 3 after the drop); `drop_history`
+/// ignores it, red (10 dropped).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn f87_3_the_history_floor_and_drop_stop_at_the_link_base() {
+    let dir = data_dir("f87-3-reach");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = write(&mut engine, G1, 10);
+    assert!(matches!(
+        engine.inherit(P, G1, G2, Seq(2)),
+        Ok(Inherited::Copied { .. })
+    ));
+    write_after(&mut engine, G2, (2, &g1), 5);
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(1)));
+
+    assert_eq!(engine.drop_history(P, G2, 0..8), Ok(5));
+    for seq in 3..=10 {
+        assert_eq!(
+            history_from(&engine, G1, seq),
+            Some(G1),
+            "G1's record {seq}"
+        );
+    }
+    for seq in 1..=5 {
+        assert_eq!(history_from(&engine, G2, seq), None, "G2 still reads {seq}");
+    }
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(6)));
+
+    let g2 = chain(P, G2, (Seq(2), g1.digest(2)), 6);
+    commit_through(&mut engine, &g2, 6);
+    assert_eq!(engine.buffered_applied(P, G2).0, 6);
+    assert_eq!(engine.history_floor(P, G2), Ok(Seq(6)));
+}
+
+/// #170 review r5 (thread 4655340442): the reach is the running minimum of the bases on the
+/// path, not each link's own base. G2 inherits G1 (10 records) at base 2, then G3 inherits G2
+/// at base 1 and holds its own 2..=5. G3 reaches G1's record 1 only.
+/// - The floor through G3 is 1.
+/// - Dropping 0..3 through G3 deletes 2 records (G1's 1 and G3's 2), and G1's record 2 stays.
+/// - The floor through G3 is then 3, not G1's record 2.
+///
+/// Cut: `history_reach` taking each link's base for its level, red (3 dropped, G1's 2 gone).
+#[cfg(debug_assertions)]
+#[retcd_test]
+fn f87_4_the_reach_is_the_lowest_base_on_the_path() {
+    let dir = data_dir("f87-4-reach");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+    let g1 = write(&mut engine, G1, 10);
+    assert!(matches!(
+        engine.inherit(P, G1, G2, Seq(2)),
+        Ok(Inherited::Copied { .. })
+    ));
+    assert!(matches!(
+        engine.inherit(P, G2, G3, Seq(1)),
+        Ok(Inherited::Copied { .. })
+    ));
+    write_after(&mut engine, G3, (1, &g1), 5);
+    assert_eq!(engine.history_floor(P, G3), Ok(Seq(1)));
+
+    assert_eq!(engine.drop_history(P, G3, 0..3), Ok(2));
+    assert_eq!(history_from(&engine, G1, 2), Some(G1), "G1's record 2");
+    assert_eq!(history_from(&engine, G3, 2), None, "G3 still reads 2");
+    assert_eq!(history_from(&engine, G3, 3), Some(G3));
+    assert_eq!(engine.history_floor(P, G3), Ok(Seq(3)));
+}

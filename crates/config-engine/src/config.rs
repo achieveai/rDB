@@ -253,6 +253,11 @@ pub struct NodeConfig {
     /// never against a cached figure — the only catch-up oracle openraft offers is the
     /// leader's own replication map (research §3.3, OQ-50).
     pub promote_max_lag: u64,
+    /// Whether `ConfigNode::start` spawns the periodic retention task. In-crate rows that
+    /// drive `evaluate_retention_once` by hand turn it off, so no tick of its own can run
+    /// between their steps (#192 review). Test builds only; a real node always runs it.
+    #[cfg(test)]
+    pub(crate) periodic_retention: bool,
 }
 
 impl NodeConfig {
@@ -277,6 +282,8 @@ impl NodeConfig {
             watch_progress_interval: crate::watch::DEFAULT_PROGRESS_INTERVAL,
             snapshot: SnapshotConfig::DISABLED,
             promote_max_lag: crate::admin::DEFAULT_PROMOTE_MAX_LAG,
+            #[cfg(test)]
+            periodic_retention: true,
         }
     }
 

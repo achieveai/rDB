@@ -17,18 +17,26 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::envelope::ReplicationEnvelope;
 use rdb_core::contracts::ids::{
-    AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, Seq, SnapshotHandle,
+    AppliedSeq, BatchId, DurableSeq, Generation, NodeId, PartitionId, ReceivedSeq, Seq,
+    SnapshotHandle,
 };
 use rdb_core::contracts::storage::{
     Batch, CapturedPrefix, DurablePrefix, Namespace, StorageFault, Write,
 };
 use rdb_core::contracts::trace::Version;
+use rdb_core::replication::append::PROGRESS_KEY;
 
 use crate::error::SimError;
 use crate::storage::history::history_writes;
 use crate::storage::snapshot::MemorySnapshot;
 use crate::storage::StorageOp;
+
+/// The bound the host's `snapshot_entry_bytes` adds to each entry's key and value: the twin of
+/// `rdb_storage::SNAPSHOT_ENTRY_OVERHEAD`.
+pub const SNAPSHOT_ENTRY_OVERHEAD: usize = 64;
 
 /// One lineage's watermarks and the batches behind them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -45,7 +53,129 @@ pub(crate) struct Lineage {
     pub(crate) parent: Option<Generation>,
     /// Every committed batch, in commit order. What a crash image replays.
     pub(crate) batches: Vec<Batch>,
+    /// This level's trim mark (issue #61), the twin of `rdb-storage`'s `trim_floor` record:
+    /// written by a trim of this lineage or of a child that cut it. [`MemoryEngine::floor`]
+    /// takes the highest mark that cuts what a lineage reads.
+    pub(crate) floor: Option<TrimFloor>,
+    /// The mark a completed sync covered. The host stages a trim unsynced, so a host crash
+    /// before the next WAL sync reopens with the older mark and its rows back
+    /// ([`crate::storage::crash_image::CrashImage`]).
+    pub(crate) floor_synced: Option<TrimFloor>,
+    /// This lineage's snapshot install (issue #61 S2), the twin of `rdb-storage`'s `installing`
+    /// record and the chunks written under it: unfinished from [`MemoryEngine::install_begin`]
+    /// until [`MemoryEngine::install_finish`], and the base every read of the lineage starts
+    /// from once finished.
+    pub(crate) install: Option<Install>,
 }
+
+/// One page entry of a snapshot install, the twin of `rdb_storage::SnapshotEntry` without the
+/// source generation: namespace, key, value, and the version it was written at.
+pub type InstallEntry = (Namespace, Bytes, Bytes, Version);
+
+/// A lineage's snapshot install: the barrier seq `at` and every chunk entry written so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Install {
+    pub(crate) at: Seq,
+    pub(crate) finished: bool,
+    pub(crate) entries: Vec<InstallEntry>,
+}
+
+/// Why an install step refused, the twin of `rdb_storage::InstallError` (the sim injects no
+/// install write fault, so no `Storage`). Nothing of that step was written in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    /// The copy holds a generation of the partition newer than the one being installed.
+    NewerGeneration {
+        /// The newest generation held.
+        held: Generation,
+    },
+    /// The lineage is not mid install, or is mid install at another `S`.
+    NotInstalling {
+        /// The `S` the step named.
+        at: Seq,
+    },
+    /// A chunk entry the export never sends: `History`, `Meta`, or the head `Progress`.
+    ForeignEntry {
+        /// Its namespace.
+        ns: Namespace,
+    },
+    /// The barrier record does not decode, claims another seq, or carries a digest that does
+    /// not recompute.
+    BadBarrier {
+        /// The `S` it should name.
+        at: Seq,
+    },
+}
+
+impl InstallError {
+    /// The `reason` field `snapshot_install_refused` carries, as the host names it.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NewerGeneration { .. } => "newer_generation",
+            Self::NotInstalling { .. } => "not_installing",
+            Self::ForeignEntry { .. } => "foreign_entry",
+            Self::BadBarrier { .. } => "bad_barrier",
+        }
+    }
+}
+
+/// A lineage's trim floor (issue #61), the twin of `rdb_storage::TrimFloor`: History holds
+/// `seq..=applied`, the record **at** `seq` included, and nothing below. Before the trim the
+/// copy checked that it descends from `(root_base, root_digest)`; the engine stores that root as
+/// given and never reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrimFloor {
+    /// The lowest seq whose History record this lineage keeps.
+    pub seq: Seq,
+    /// The base of the root this copy proved it descends from.
+    pub root_base: Seq,
+    /// The record digest at [`Self::root_base`] ([`Digest::ROOT`] at 0).
+    pub root_digest: Digest,
+}
+
+/// Why [`MemoryEngine::trim_history`] refused, the twin of `rdb_storage::TrimRefused` (the sim
+/// has no staged copy, so no `Staging`). Nothing was written in any case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrimRefused {
+    /// The engine holds no such lineage.
+    UnknownLineage,
+    /// A child inherited the lineage: its History is trimmed through the child's walk.
+    Sealed {
+        /// The child generation.
+        child: Generation,
+    },
+    /// The floor is above the lineage's applied watermark: the record at it does not exist.
+    AboveApplied {
+        /// The floor asked for.
+        floor: Seq,
+        /// The lineage's applied watermark.
+        applied: AppliedSeq,
+    },
+    /// The floor is below the one the lineage already reads under: a floor never moves down.
+    BelowFloor {
+        /// The floor asked for.
+        floor: Seq,
+        /// [`MemoryEngine::floor_seq`] now.
+        current: Seq,
+    },
+}
+
+impl TrimRefused {
+    /// The `reason` field `history_trim_refused` carries, as the host names it.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownLineage => "unknown_lineage",
+            Self::Sealed { .. } => "sealed",
+            Self::AboveApplied { .. } => "above_applied",
+            Self::BelowFloor { .. } => "below_floor",
+        }
+    }
+}
+
+/// A lineage with its key, as an unsynced begin found it.
+type HeldLineage = ((PartitionId, Generation), Lineage);
 
 /// One core set's data engine.
 ///
@@ -61,6 +191,11 @@ pub struct MemoryEngine {
     false_claims: Vec<AppliedSeq>,
     /// Each capture a [`StorageOp::StallFlush`] held, in order, for the oracle. Never synced.
     stalled: Vec<Vec<CapturedPrefix>>,
+    /// Each partition's lineages as they were before an `install_begin` no sync has covered yet
+    /// (issue #61). The host's begin is one unsynced batch, so a host crash loses it **with its
+    /// wipe** and the old copy comes back; [`crate::storage::crash_image::CrashImage`] reads
+    /// these in place of the partition's lineages then.
+    unsynced_begins: BTreeMap<PartitionId, Vec<HeldLineage>>,
 }
 
 impl MemoryEngine {
@@ -74,6 +209,7 @@ impl MemoryEngine {
             planned: Vec::new(),
             false_claims: Vec::new(),
             stalled: Vec::new(),
+            unsynced_begins: BTreeMap::new(),
         }
     }
 
@@ -143,6 +279,19 @@ impl MemoryEngine {
     ///
     /// The planned [`StorageFault`] for the next commit, with nothing applied.
     pub fn commit(&mut self, batch: Batch) -> Result<AppliedSeq, StorageFault> {
+        // The twin of the host's refusal (issue #61): an install in progress owns the lineage
+        // until it finishes; a commit would land among chunks under a barrier it does not chain to.
+        if let Some((_, at)) = self.installing(batch.partition, batch.generation) {
+            tracing::error!(
+                node = self.node.0,
+                partition = batch.partition.0,
+                generation = batch.generation.0,
+                seq = batch.seq.0,
+                at = at.0,
+                "installing_generation_write_refused"
+            );
+            return Err(StorageFault::WriteFailed);
+        }
         if let Some(StorageOp::Fail { fault, .. }) = self.take_planned(|op| {
             matches!(
                 op,
@@ -229,6 +378,12 @@ impl MemoryEngine {
             _ => None,
         };
         self.take_at_rest();
+        // A sync that runs covers every write staged before it, the trim marks included
+        // (issue #61): the host's WAL sync is one log for the whole engine.
+        for lineage in self.lineages.values_mut() {
+            lineage.floor_synced = lineage.floor;
+        }
+        self.unsynced_begins.clear();
         let mut durable = Vec::with_capacity(captured.len());
         for capture in captured {
             // A lineage this engine was never given holds nothing: its durable prefix is the
@@ -418,10 +573,24 @@ impl MemoryEngine {
         generation: Generation,
         handle: SnapshotHandle,
     ) -> MemorySnapshot {
+        MemorySnapshot::new(
+            handle,
+            rdb_core::contracts::ids::Seq(self.buffered_applied(partition, generation).0),
+            generation,
+            self.view(partition, generation),
+        )
+    }
+
+    /// Every record lineage `(partition, generation)` shows, as [`Self::snapshot`] describes.
+    fn view(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> BTreeMap<(Namespace, Bytes), (Bytes, Version)> {
         let inherited = self
             .lineage(partition, generation)
             .is_some_and(|lineage| lineage.parent.is_some());
-        let records = if inherited {
+        if inherited {
             let mut records = BTreeMap::new();
             self.replay_into(partition, generation, None, &mut records);
             records
@@ -433,13 +602,65 @@ impl MemoryEngine {
                     ((*ns, key.clone()), (value.clone(), *version))
                 })
                 .collect()
-        };
-        MemorySnapshot::new(
-            handle,
-            rdb_core::contracts::ids::Seq(self.buffered_applied(partition, generation).0),
-            generation,
-            records,
-        )
+        }
+    }
+
+    /// One page of lineage `(partition, generation)`'s view after the exclusive cursor `after`,
+    /// at most `limit` entries in `(namespace, key)` order (issue #61 S2): the twin of
+    /// `RocksSnapshot::entries_after`, which the host's source pages with. History and the head
+    /// `Progress` are left out: the barrier carries History and `install_finish` writes the
+    /// head. Meta is left out too; the host's export lists it, but format 1 stores no Meta
+    /// record under a lineage (commit and open refuse one, m8s_25a and m8s_25b), so neither
+    /// list ever yields one, and an install refuses all three ([`InstallError::ForeignEntry`]),
+    /// as the host's does. Each entry carries the version its record was written at.
+    #[must_use]
+    pub fn entries_after(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        after: Option<&(Namespace, Bytes)>,
+        limit: usize,
+    ) -> Vec<InstallEntry> {
+        self.page_after(partition, generation, after, limit, usize::MAX)
+            .0
+    }
+
+    /// The twin of `RocksSnapshot::page_after` (PR #204 review): [`Self::entries_after`]
+    /// capped by size as well as count, stopping before the entry that would take the page's
+    /// `key + value + SNAPSHOT_ENTRY_OVERHEAD` bytes past `max_bytes` (the first always goes),
+    /// and whether the view holds an entry after the page.
+    #[must_use]
+    pub fn page_after(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        after: Option<&(Namespace, Bytes)>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> (Vec<InstallEntry>, bool) {
+        let mut rest = self
+            .view(partition, generation)
+            .into_iter()
+            .filter(|((ns, key), _)| {
+                !matches!(ns, Namespace::History | Namespace::Meta)
+                    && !(*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY)
+            })
+            .filter(|(cursor, _)| after.is_none_or(|after| cursor > after))
+            .peekable();
+        let (mut page, mut bytes) = (Vec::new(), 0_usize);
+        while let Some(((_, key), (value, _))) = rest.peek() {
+            let size = key.len() + value.len() + SNAPSHOT_ENTRY_OVERHEAD;
+            if page.len() >= limit || (!page.is_empty() && bytes + size > max_bytes) {
+                break;
+            }
+            bytes += size;
+            let Some(((ns, key), (value, version))) = rest.next() else {
+                break;
+            };
+            page.push((ns, key, value, version));
+        }
+        let more = rest.peek().is_some();
+        (page, more)
     }
 
     /// Apply `generation`'s history to `records`: its predecessor's through the base it was cut
@@ -458,6 +679,17 @@ impl MemoryEngine {
         if let Some(parent) = lineage.parent {
             let cut = through.map_or(lineage.base, |through| through.min(lineage.base));
             self.replay_into(partition, parent, Some(cut), records);
+        }
+        // An install is the lineage's state as of its barrier: a read cut below it shows none of
+        // it (`inherit` refuses such a cut above zero, as the floor sits at the barrier).
+        if let Some(install) = lineage
+            .install
+            .as_ref()
+            .filter(|install| through.is_none_or(|through| through >= install.at))
+        {
+            for (ns, key, value, version) in &install.entries {
+                records.insert((*ns, key.clone()), (value.clone(), *version));
+            }
         }
         let within = |batch: &&Batch| through.is_none_or(|through| batch.seq <= through);
         for batch in lineage.batches.iter().filter(within) {
@@ -484,7 +716,8 @@ impl MemoryEngine {
     /// this lineage's own batches, the latest to write that key. A latest write that deletes the
     /// key is final: the record is gone, and an older write of it does not show through (lead
     /// ruling B-R58d; [`StorageOp::LoseRecord`] relies on it). `None` when nothing the lineage
-    /// shows holds it.
+    /// shows holds it, and below the lineage's trim floor ([`Self::floor_seq`], issue #61):
+    /// the trim deleted those records.
     #[must_use]
     pub fn history_at(
         &self,
@@ -492,8 +725,149 @@ impl MemoryEngine {
         generation: Generation,
         seq: Seq,
     ) -> Option<(Bytes, Option<Bytes>)> {
+        if seq < self.floor_seq(partition, generation) {
+            return None;
+        }
         self.history_batch(partition, generation, seq)
             .and_then(|batch| history_writes(batch, seq))
+    }
+
+    /// The trim mark lineage `(partition, generation)` reads under, with the generation whose
+    /// level holds it (issue #61), the twin of `RocksEngine::floor`: the **highest** mark that
+    /// cuts what the lineage reads. A level's mark counts only while it is at most one past the
+    /// last seq the lineage reads there: `applied + 1` on its own level, `base + 1` through a
+    /// link, the smallest along the path. `None` when no level holds one.
+    #[must_use]
+    pub fn floor(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<(Generation, TrimFloor)> {
+        let mut best: Option<(Generation, TrimFloor)> = None;
+        let mut level = generation;
+        let mut top = self
+            .buffered_applied(partition, generation)
+            .0
+            .saturating_add(1);
+        loop {
+            let Some(lineage) = self.lineage(partition, level) else {
+                return best;
+            };
+            if let Some(floor) = lineage.floor.filter(|floor| floor.seq.0 <= top) {
+                if best.is_none_or(|(_, held)| floor.seq > held.seq) {
+                    best = Some((level, floor));
+                }
+            }
+            let Some(parent) = lineage.parent else {
+                return best;
+            };
+            top = top.min(lineage.base.0.saturating_add(1));
+            level = parent;
+        }
+    }
+
+    /// The lowest seq whose History record the lineage keeps: [`Self::floor`]'s seq, or
+    /// [`Seq::ZERO`] when it was never trimmed.
+    #[must_use]
+    pub fn floor_seq(&self, partition: PartitionId, generation: Generation) -> Seq {
+        self.floor(partition, generation)
+            .map_or(Seq::ZERO, |(_, floor)| floor.seq)
+    }
+
+    /// Trim lineage `(partition, generation)`'s History below `floor.seq`, the twin of
+    /// `RocksEngine::stage_trim_history` (issue #61). Staged unsynced: a host crash before the
+    /// next sync loses it (`Lineage::floor_synced`).
+    ///
+    /// The walk follows the chain: the own level is cut at `floor.seq`, a level reached through
+    /// links at bases `b1, b2, ..` at `min(floor, b1+1, b2+1, ..)`, and each level cut is marked
+    /// at its cut with `floor`'s root, unless it already holds a higher mark. A parent's records
+    /// above the base are never touched. The records are not removed from the batches a crash
+    /// image replays: the mark bounds every read ([`Self::history_at`]), which is what the host's
+    /// range delete makes true. Returns how many levels the walk visited. Logs
+    /// `history_trimmed{levels, from, to}` or `history_trim_refused{reason}`.
+    ///
+    /// # Errors
+    ///
+    /// A [`TrimRefused`] naming why; nothing is written in any case.
+    pub fn trim_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+    ) -> Result<usize, TrimRefused> {
+        let current = self.floor_seq(partition, generation);
+        let result = self.cut_history(partition, generation, floor, current);
+        let (p, g, to) = (partition.0, generation.0, floor.seq.0);
+        match result {
+            Ok(levels) => tracing::info!(
+                node = self.node.0,
+                partition = p,
+                generation = g,
+                levels,
+                from = current.0,
+                to,
+                "history_trimmed"
+            ),
+            Err(refused) => tracing::warn!(
+                node = self.node.0,
+                partition = p,
+                generation = g,
+                from = current.0,
+                to,
+                reason = refused.reason(),
+                "history_trim_refused"
+            ),
+        }
+        result
+    }
+
+    fn cut_history(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+        current: Seq,
+    ) -> Result<usize, TrimRefused> {
+        let applied = self
+            .lineage(partition, generation)
+            .ok_or(TrimRefused::UnknownLineage)?
+            .applied;
+        if let Some((&(_, child), _)) = self
+            .lineages
+            .iter()
+            .find(|(&(p, _), lineage)| p == partition && lineage.parent == Some(generation))
+        {
+            return Err(TrimRefused::Sealed { child });
+        }
+        if floor.seq.0 > applied.0 {
+            return Err(TrimRefused::AboveApplied {
+                floor: floor.seq,
+                applied,
+            });
+        }
+        if floor.seq < current {
+            return Err(TrimRefused::BelowFloor {
+                floor: floor.seq,
+                current,
+            });
+        }
+        let (mut level, mut end, mut levels) = (generation, floor.seq.0, 0_usize);
+        loop {
+            levels += 1;
+            let lineage = self.lineages.entry((partition, level)).or_default();
+            if lineage.floor.is_none_or(|held| held.seq.0 < end) {
+                lineage.floor = Some(TrimFloor {
+                    seq: Seq(end),
+                    ..floor
+                });
+            }
+            let Some(parent) = lineage.parent else {
+                break;
+            };
+            end = end.min(lineage.base.0.saturating_add(1));
+            level = parent;
+        }
+        Ok(levels)
     }
 
     /// The latest batch to write the `History` key at `seq`, set or deleted, in the lineage
@@ -621,7 +995,8 @@ impl MemoryEngine {
     /// # Errors
     ///
     /// [`SimError::Config`] naming `inherit` when `from` is not an earlier generation than `to`,
-    /// or when `to` already descends from a different generation.
+    /// or when `to` already descends from a different generation; naming `inherit_below_floor`
+    /// when the base is above zero and below `from`'s trim floor (issue #61).
     pub fn inherit(
         &mut self,
         partition: PartitionId,
@@ -640,8 +1015,48 @@ impl MemoryEngine {
         {
             return Err(refused);
         }
+        // The twin of `InheritError::ParentInstalling` (issue #61), and its mirror into an
+        // installing lineage: a half-written view is neither inherited from nor linked under.
+        let installing = [(from, "from"), (to, "to")]
+            .into_iter()
+            .find_map(|(generation, side)| {
+                self.installing(partition, generation)
+                    .map(|(_, at)| (side, at))
+            });
+        if let Some((side, at)) = installing {
+            tracing::error!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                side,
+                at = at.0,
+                "installing_inherit_refused"
+            );
+            return Err(SimError::Config {
+                field: "inherit_installing",
+            });
+        }
         let held = self.buffered_applied(partition, from);
-        self.restore_base(partition, to, from, Seq(through.0.min(held.0)));
+        let base = Seq(through.0.min(held.0));
+        // The twin of `as_of_base`'s floor bound (issue #61, A2): the record at a base below
+        // `from`'s trim floor is gone, so nothing can be read as of it.
+        let floor = self.floor_seq(partition, from);
+        if base.0 > 0 && base < floor {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                from = from.0,
+                to = to.0,
+                base = base.0,
+                floor = floor.0,
+                "inherit_below_floor"
+            );
+            return Err(SimError::Config {
+                field: "inherit_below_floor",
+            });
+        }
+        self.restore_base(partition, to, from, base);
         Ok(())
     }
 
@@ -680,6 +1095,38 @@ impl MemoryEngine {
         self.lineages.iter()
     }
 
+    /// The lineages a host crash finds, in `(partition, generation)` order: a partition whose
+    /// `install_begin` no sync covered shows its lineages from before that begin.
+    pub(crate) fn host_crash_lineages(&self) -> Vec<(&(PartitionId, Generation), &Lineage)> {
+        let mut lineages: Vec<_> = self
+            .lineages
+            .iter()
+            .filter(|((p, _), _)| !self.unsynced_begins.contains_key(p))
+            .chain(
+                self.unsynced_begins
+                    .values()
+                    .flatten()
+                    .map(|(key, lineage)| (key, lineage)),
+            )
+            .collect();
+        lineages.sort_by_key(|(key, _)| **key);
+        lineages
+    }
+
+    /// Restore a lineage's trim mark from a crash image ([`CrashImage::reopen`]), as synced.
+    ///
+    /// [`CrashImage::reopen`]: crate::storage::crash_image::CrashImage::reopen
+    pub(crate) fn restore_floor(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        floor: TrimFloor,
+    ) {
+        let lineage = self.lineages.entry((partition, generation)).or_default();
+        lineage.floor = Some(floor);
+        lineage.floor_synced = Some(floor);
+    }
+
     /// Restore a lineage's durable watermark from a crash image. `pub(crate)` on purpose: the
     /// only caller is [`crate::storage::crash_image::CrashImage::reopen`], which restores a value
     /// a real sync produced before the crash.
@@ -691,6 +1138,313 @@ impl MemoryEngine {
     ) {
         let lineage = self.lineages.entry((partition, generation)).or_default();
         lineage.durable = durable;
+    }
+
+    /// Step 1 of a snapshot install (issue #61 S2), the twin of `RocksEngine::install_begin`:
+    /// wipe every lineage `partition` holds — its records, batches, links and marks — and start lineage `(partition, generation)` installing at barrier `at`, as one
+    /// step (the host's one `WriteBatch`, rev 5b). A begin while already installing starts over.
+    /// Logs `snapshot_install_begun{wiped}` or `snapshot_install_refused{step: "begin"}`.
+    ///
+    /// Unsynced on the host. The sim does not model a host crash undoing it: see
+    /// [`crate::storage::crash_image::CrashImage`].
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NewerGeneration`] when the copy holds a newer generation of the
+    /// partition. Nothing is written.
+    pub fn install_begin(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+    ) -> Result<(), InstallError> {
+        let wiped: Vec<u64> = self
+            .lineages
+            .keys()
+            .filter(|(p, _)| *p == partition)
+            .map(|(_, g)| g.0)
+            .collect();
+        let held = wiped.last().copied().map(Generation);
+        if let Some(held) = held.filter(|held| *held > generation) {
+            let refused = InstallError::NewerGeneration { held };
+            self.install_refused(partition, generation, at, "begin", refused);
+            return Err(refused);
+        }
+        // A second unsynced begin keeps the first one's pre-begin copy: a host crash loses both.
+        if !self.unsynced_begins.contains_key(&partition) {
+            let before: Vec<HeldLineage> = self
+                .lineages
+                .iter()
+                .filter(|((p, _), _)| *p == partition)
+                .map(|(key, lineage)| (*key, lineage.clone()))
+                .collect();
+            self.unsynced_begins.insert(partition, before);
+        }
+        self.lineages.retain(|&(p, _), _| p != partition);
+        self.records.retain(|&(p, _, _), _| p != partition);
+        self.lineages.insert(
+            (partition, generation),
+            Lineage {
+                install: Some(Install {
+                    at,
+                    finished: false,
+                    entries: Vec::new(),
+                }),
+                ..Lineage::default()
+            },
+        );
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            at = at.0,
+            wiped = ?wiped,
+            "snapshot_install_begun"
+        );
+        Ok(())
+    }
+
+    /// Step 2, the twin of `RocksEngine::install_chunk`: write one page of the source's view
+    /// into the installing lineage, each entry at its own version. Returns how many it wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NotInstalling`] unless the lineage is installing at `at`;
+    /// [`InstallError::ForeignEntry`] for a `History` or `Meta` entry or the head `Progress`.
+    /// Nothing of the chunk is written.
+    pub fn install_chunk(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        entries: &[InstallEntry],
+    ) -> Result<usize, InstallError> {
+        let result = self.chunk_install(partition, generation, at, entries);
+        match result {
+            Ok(written) => tracing::debug!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                at = at.0,
+                written,
+                "snapshot_install_chunk"
+            ),
+            Err(refused) => self.install_refused(partition, generation, at, "chunk", refused),
+        }
+        result
+    }
+
+    fn chunk_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        entries: &[InstallEntry],
+    ) -> Result<usize, InstallError> {
+        self.check_installing(partition, generation, at)?;
+        if let Some((ns, _, _, _)) = entries.iter().find(|(ns, key, _, _)| {
+            matches!(ns, Namespace::History | Namespace::Meta)
+                || (*ns == Namespace::Progress && key.as_ref() == PROGRESS_KEY)
+        }) {
+            return Err(InstallError::ForeignEntry { ns: *ns });
+        }
+        for (ns, key, value, version) in entries {
+            self.records
+                .insert((partition, *ns, key.clone()), (value.clone(), *version));
+        }
+        if let Some(install) = self
+            .lineages
+            .get_mut(&(partition, generation))
+            .and_then(|lineage| lineage.install.as_mut())
+        {
+            install.entries.extend_from_slice(entries);
+        }
+        Ok(entries.len())
+    }
+
+    /// Step 3, the twin of `RocksEngine::install_finish`: commit the barrier's History record
+    /// and head `Progress` at `at` (so `applied = at`), set the [`TrimFloor`] at `at` with
+    /// `root`, and end the install. Synced on the host, so the floor is marked synced and a host
+    /// crash keeps the install ([`crate::storage::crash_image::CrashImage`]). `durable` is
+    /// **not** moved: the next real sync credits it, as after any commit.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::NotInstalling`] unless the lineage is installing at `at`;
+    /// [`InstallError::BadBarrier`] when `barrier` does not decode, claims another seq or
+    /// carries a digest that does not recompute. Nothing is written; the lineage stays
+    /// installing.
+    pub fn install_finish(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        barrier: &Bytes,
+        root: (Seq, Digest),
+    ) -> Result<(), InstallError> {
+        let result = self.finish_install(partition, generation, at, barrier, root);
+        match result {
+            Ok(()) => tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                at = at.0,
+                root_base = root.0 .0,
+                "snapshot_install_finished"
+            ),
+            Err(refused) => self.install_refused(partition, generation, at, "finish", refused),
+        }
+        result
+    }
+
+    fn finish_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        barrier: &Bytes,
+        root: (Seq, Digest),
+    ) -> Result<(), InstallError> {
+        self.check_installing(partition, generation, at)?;
+        let bad = InstallError::BadBarrier { at };
+        let envelope = ReplicationEnvelope::decode(barrier).map_err(|_| bad)?;
+        if envelope.header.seq != at
+            || envelope.compute_record_digest().ok() != Some(envelope.record_digest)
+        {
+            return Err(bad);
+        }
+        let mut progress = at.0.to_le_bytes().to_vec();
+        progress.extend_from_slice(&envelope.record_digest.0);
+        let floor = TrimFloor {
+            seq: at,
+            root_base: root.0,
+            root_digest: root.1,
+        };
+        // A synced write: the WAL is one log, so it covers the begin and every chunk before it.
+        self.unsynced_begins.clear();
+        for lineage in self.lineages.values_mut() {
+            lineage.floor_synced = lineage.floor;
+        }
+        if let Some(lineage) = self.lineages.get_mut(&(partition, generation)) {
+            lineage.floor = Some(floor);
+            lineage.floor_synced = Some(floor);
+            if let Some(install) = lineage.install.as_mut() {
+                install.finished = true;
+            }
+        }
+        self.apply(Batch {
+            id: BatchId(at.0),
+            partition,
+            generation,
+            seq: at,
+            writes: vec![
+                Write {
+                    ns: Namespace::History,
+                    key: Bytes::copy_from_slice(&at.0.to_be_bytes()),
+                    value: Some(barrier.clone()),
+                },
+                Write {
+                    ns: Namespace::Progress,
+                    key: Bytes::from_static(PROGRESS_KEY),
+                    value: Some(Bytes::from(progress)),
+                },
+            ],
+        });
+        Ok(())
+    }
+
+    /// The `(source generation, at)` of lineage `(partition, generation)`'s unfinished install,
+    /// `None` when none is in progress, the twin of `RocksEngine::installing`.
+    #[must_use]
+    pub fn installing(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+    ) -> Option<(Generation, Seq)> {
+        self.lineage(partition, generation)
+            .and_then(|lineage| lineage.install.as_ref())
+            .filter(|install| !install.finished)
+            .map(|install| (generation, install.at))
+    }
+
+    fn check_installing(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+    ) -> Result<(), InstallError> {
+        if self.installing(partition, generation) == Some((generation, at)) {
+            Ok(())
+        } else {
+            Err(InstallError::NotInstalling { at })
+        }
+    }
+
+    fn install_refused(
+        &self,
+        partition: PartitionId,
+        generation: Generation,
+        at: Seq,
+        step: &'static str,
+        refused: InstallError,
+    ) {
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            at = at.0,
+            step,
+            reason = refused.reason(),
+            "snapshot_install_refused"
+        );
+    }
+
+    /// Restore a lineage's install from a crash image, before its batches replay: an install's
+    /// entries are the base its batches write over.
+    pub(crate) fn restore_install(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        install: Option<&Install>,
+    ) {
+        if let Some(install) = install {
+            for (ns, key, value, version) in &install.entries {
+                self.records
+                    .insert((partition, *ns, key.clone()), (value.clone(), *version));
+            }
+        }
+        let lineage = self.lineages.entry((partition, generation)).or_default();
+        lineage.install = install.cloned();
+    }
+
+    /// Clear every lineage still installing, the twin of the host's `clear_installs` at a
+    /// read-write open: the partial copy is removed and the lineage rejoins empty. Logs
+    /// `snapshot_install_cleared_at_open` for each.
+    pub(crate) fn clear_installs(&mut self) {
+        let cleared: Vec<((PartitionId, Generation), Install)> = self
+            .lineages
+            .iter()
+            .filter_map(|(&key, lineage)| {
+                lineage
+                    .install
+                    .clone()
+                    .filter(|install| !install.finished)
+                    .map(|install| (key, install))
+            })
+            .collect();
+        for ((partition, generation), install) in cleared {
+            self.lineages.remove(&(partition, generation));
+            for (ns, key, _, _) in &install.entries {
+                self.records.remove(&(partition, *ns, key.clone()));
+            }
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                at = install.at.0,
+                "snapshot_install_cleared_at_open"
+            );
+        }
     }
 
     fn lineage(&self, partition: PartitionId, generation: Generation) -> Option<&Lineage> {
