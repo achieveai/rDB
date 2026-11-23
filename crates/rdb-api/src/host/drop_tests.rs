@@ -13829,59 +13829,80 @@ fn t61_r26_b_a_live_owner_dropped_by_promote_goes_writable_once_copy_3_is_caught
         false,
     );
 }
+
 #[config_log::retcd_test]
 fn i250_a_restarted_receiver_refuses_the_previous_boots_committed_root() {
+    use rdb_core::contracts::control::{CasOutcome, ControlKey};
+
     const METHOD: &str = "i250_a_restarted_receiver_refuses_the_previous_boots_committed_root";
     let dir = config_testkit::fs::temp_dir();
-    let (mut trio, generation) = started(dir.path(), tuned);
+    let mut trio = Trio::new(dir.path(), tuned);
     let partition = PartitionId(1);
-    let result = trio.nodes[0].0.committed[&partition].clone();
-    let old_boot = trio.nodes[1].0.boot;
-    assert!(in_barrier(&result, NodeId(2)));
+    trio.bootstrap();
+    // The empty bootstrap committed. Hold its completion until node 2's replacement is registered.
+    let completion = super::seal_tests::only_until(&mut trio, &[1, 2], "bootstrap CAS", |trio| {
+        let (owner, _, incoming) = &mut trio.nodes[0];
+        owner.run_due();
+        owner.drain();
+        while let Ok(msg) = incoming.try_recv() {
+            if matches!(&msg, Msg::Control {
+                event: ControlEvent::CasResult {
+                    key: ControlKey::Partition(p),
+                    outcome: CasOutcome::Committed(_),
+                    ..
+                }, ..
+            } if *p == partition)
+            {
+                return Some(msg);
+            }
+            owner.handle(msg);
+        }
+        None
+    });
+    let old = &trio.nodes[1].0;
+    let old_boot = old.boot;
+    assert!(old.landed.is_empty());
+    assert!(!old.committed.contains_key(&partition));
+
+    let boot = restart_as(&mut trio, dir.path(), 2, true);
+    assert!(boot > old_boot);
+    assert!(trio.nodes[1].0.engine.lineages().is_empty());
+    let owner = &mut trio.nodes[0].0;
+    owner.handle(completion);
+    owner.drain();
+    let result = &owner.committed[&partition];
+    let generation = result.new_generation;
+    assert_eq!(result.selected.cutoff_seq, Seq(0));
+    assert!(in_barrier(result, NodeId(2)));
     assert!(result.committed.pinned_config.members.iter().any(|member| {
         member.node == NodeId(2)
             && member.boot == old_boot
             && member.boot != crate::admin::UNLINKED_BOOT
     }));
-    assert_eq!(
-        trio.nodes[1].0.committed[&partition].new_generation,
-        generation
-    );
-    assert!(trio.nodes[1]
-        .0
-        .engine
-        .lineages()
-        .contains(&(partition, generation)));
 
-    let boot = restart_as(&mut trio, dir.path(), 2, true);
-    let (host, mailbox, incoming) = &mut trio.nodes[1];
-    assert!(boot > old_boot);
-    assert!(host.engine.lineages().is_empty());
-    mailbox
-        .send(Msg::Landed {
-            result,
-            partition,
-            correlation: CorrelationId(0),
-            emitter: NodeId(1),
-            not_before: host.clock.now(),
-            owner_live_readd: false,
-        })
-        .expect("replacement mailbox open");
-    host.handle_msg(
-        incoming
-            .try_recv()
-            .expect("replacement receives the landing"),
+    // Only the two receivers run. Node 1 cannot consume PeerBooted and start a new plan here.
+    super::seal_tests::only_until(
+        &mut trio,
+        &[1, 2],
+        "both receivers handled the fanout",
+        |trio| {
+            (trio.nodes[2].0.landed.contains(&(partition, generation))
+                && !logged!(METHOD, "recovered_refused_stale_boot").is_empty())
+            .then_some(())
+        },
     );
-    host.run_due();
-
     let refused = logged!(METHOD, "recovered_refused_stale_boot");
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(refused[0]["node"], 2);
     assert_eq!(refused[0]["boot"], boot.0);
     assert_eq!(refused[0]["pinned_boot"], old_boot.0);
     assert_eq!(refused[0]["generation"], generation.0);
-    assert!(host.fault.is_none());
-    assert!(!host.landed.contains(&(partition, generation)));
-    assert!(!host.committed.contains_key(&partition));
-    assert!(host.engine.lineages().is_empty());
+    let receiver = &trio.nodes[1].0;
+    assert!(receiver.fault.is_none());
+    assert!(!receiver.landed.contains(&(partition, generation)));
+    assert!(!receiver.committed.contains_key(&partition));
+    assert!(receiver.engine.lineages().is_empty());
+    let peer = &trio.nodes[2].0;
+    assert_eq!(peer.committed[&partition].new_generation, generation);
+    assert!(peer.engine.lineages().contains(&(partition, generation)));
 }
