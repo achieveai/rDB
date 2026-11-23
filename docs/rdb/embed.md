@@ -800,8 +800,9 @@ the supervisor gives up; with Docker's `--restart on-failure:3`, it is restarted
 then stays down.
 
 **A removed id in `--peers` is skipped.** It is logged `start_peer_removed_skipped`, and
-nothing dials it. You need not list a removed lower id; every live lower id must still be
-listed.
+nothing dials it. It must still be listed: `--node` and `--peers` together must name nodes
+1 to K with no gap, removed ids included. Only removed ids above every id you name may be left
+out.
 
 **One change at a time, and every node must answer.** Before it writes anything, the check
 asks every live node for a fresh status, within the time you pass (`within`). Each must
@@ -873,6 +874,9 @@ Upgrade the dead node before you ever restart it. As a removed node it will not 
   that needs a restart (#207).
 - `no_live_handoff: ...`: a primary move that rebalance never runs; ownership stays where it
   is.
+- `copy_not_run: ...`: a copy move the plan made but this run did not make, because the move
+  budget ran out or it waits on a primary handoff listed above. Run the rebalance again; one
+  that waits on a handoff stays until the owner moves by failover or drain.
 
 **Upgrade the whole cluster first, apps included.** This is the same one-way, whole-cluster
 upgrade as in "Known limits in this release" ("This build's upgrade is one-way ..."). The S4
@@ -1835,13 +1839,14 @@ above comes back by itself once its link is back:
 - **Restart warning.** While a return can still come, the owner does not log
   `copy_left_out_until_restart`. Once the copy's link has stayed down for
   `Timeouts::unreachable_drop_after` again, it does, naming the node.
-- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (12 at this commit:
-  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list), whether or not this setting is on. A
-  build before these guards speaks 9, even one that has this setting, and a build at 10 or 11 lacks
-  the snapshot wire or the delete and list. A build at another version and this one refuse each other when they
+- **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (13 at this commit:
+  10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list, 13
+  #80 S4's `members_revision` and refill call), whether or not this setting is on. A
+  build before these guards speaks 9, even one that has this setting, and a build at 10, 11 or 12
+  lacks the snapshot wire, the delete and list, or S4's fields. A build at another version and this one refuse each other when they
   connect, each logging `net_handshake_refused` with both versions. So an older node is never
   added back live, and it cannot link at all. The same holds for an app process with no copy
-  (`--nodes`): an app at an older version is refused by nodes at 12. To upgrade: stop every
+  (`--nodes`): an app at an older version is refused by nodes at 13. To upgrade: stop every
   node and every app process that links to them, upgrade them all, start the nodes, then the
   apps. A rolling upgrade, with processes at different versions, does not link.
 - **Mixed settings.** The owner's setting decides. It travels with the landing, so a copy

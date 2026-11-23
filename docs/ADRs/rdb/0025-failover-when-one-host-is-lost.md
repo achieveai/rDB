@@ -32,7 +32,7 @@ plus ids still linked).
    `OutageBound`, with one expected outage per `OutageClass`. The terms below are at the spec
    defaults (`Budgets::SPEC_DEFAULTS`, `Timeouts::default`, `Failover::default`), measured by a
    probe whose puts time out after 1 s (`PROBE_PUT_TIMEOUT`). Every class ends with the same
-   retry term: the put timeout plus one `RETRY_GAP` (1.25 s).
+   retry term, 1.25 s in all: the put timeout (1 s) plus one `RETRY_GAP` (250 ms).
 
    | Class | What decides it | Terms | Expected |
    |---|---|---|---|
@@ -170,15 +170,18 @@ plus ids still linked).
 15. **`rdb_node` exits 0 when removed, and 2 when started as a removed node.** It checks
     `Db::removed()` once a second; once removed it prints `rdb_node removed node=N`
     (`rdb_node_removed`), shuts down and exits 0, asking for no restart. A start whose
-    `--node` is removed is a bad argument: `removed_start_check` runs before any other start
-    step, prints "rdb_node: start check: node N was removed; ids are never reused; nothing
+    `--node` is removed is a bad argument: `removed_start_check` runs after the argument
+    checks and the `--peers` check (`peer_set`), and before the record start check, the boot
+    write and the bind. It prints "rdb_node: start check: node N was removed; ids are never reused; nothing
     was started" (`rdb_node_start_refused`) and exits 2. A `Db` open as a removed node is
     refused with the same text (`admin::own_removed_refusal`, `admin::removed_node_text`).
 
 16. **A removed id in `--peers` is skipped, not refused (S-4).** The start check skips it
     with the warn `start_peer_removed_skipped` (`node`, `peer`, `addr`), and nothing dials it.
-    A removed lower id need not be listed; every live lower id still must be. A peer that is
-    neither live nor removed is still refused.
+    It must still be listed: `peer_set` takes `--node` and `--peers` as nodes 1 to K with
+    no gap, so every id up to the highest one named is listed, removed or not. Only removed
+    ids above every id named may be left out. A peer that is neither live nor removed is still
+    refused.
 
 17. **A re-plan never pins a node that is not live (S-2).** An owner pins a re-added node or
     a move's target only while that node is a live member of its `Net`. Otherwise it leaves
@@ -394,10 +397,13 @@ cleared.
 
 Each was shown red under a source cut first, then green.
 
-In `crates/rdb-api/src/db/s80s4_tests.rs`:
+In `crates/rdb-core/src/authority/node.rs`:
 
 - `s80s4_node_record_layout_3_round_trips_and_keeps_the_app_address` (unit). Cut: the state
   byte ignored; red at "state byte 0".
+
+In `crates/rdb-api/src/db/s80s4_tests.rs`:
+
 - `s80s4_an_open_on_a_removed_record_is_refused_and_route_keeps_its_app_address`. Cut: no
   removed check; red "not a node record this build reads".
 - `s80s4_a_removed_record_beside_live_ones_leaves_members_open_and_route_working` (five
@@ -476,9 +482,6 @@ In `crates/rdb-api/src/db/s80s4_tests.rs` and `s80s3_tests.rs`:
 In `crates/rdb-api/src/admin/drain.rs`:
 
 - `s80s4_drain_targets_refuse_before_the_freeze_for_each_s1_reason` (unit).
-
-Not a row: `m11_q1_a_peer_speaking_protocol_version_3_is_refused` now formats
-`PROTOCOL_VERSION` instead of pinning a number, because the bump changed what it pinned.
 
 In `crates/rdb-api/src/db/s80s3_tests.rs`, a dead host removed and refilled:
 
