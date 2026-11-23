@@ -526,21 +526,19 @@ fn m10_s2_b7_a_linked_copy_that_stalls_is_dropped() {
     }
 }
 
-/// b8 (A-R282 N1): node 3's links are held until L1 pauses and most of the drop clock has
-/// run, then healed. Node 3 catches up while L1's resume hold, longer than what was left of
-/// the clock, keeps writes refused. Its durable sequence advancing starts the clock again, so
-/// it is not dropped, and writes resume with all three.
-/// Re-timed for #67 (A-R435): node 3 is unreachable from the hold on, before the pause, so the
-/// row runs a 2 s clock and heals at 60% of it. Node 3 is then heard about 400 ms before its
-/// unreachable count would reach the clock, and only the paused clock is left to pin.
-/// Cut: the clock from the last admit only (`Blame::next` keeps `since` whatever the copy and
-/// its durable sequence), red (node 3 dropped during the resume hold). Comparing the copy alone
-/// stays green here: once node 3 is heard, keepalives move `stalest_copy` between nodes 2 and
-/// 3, and each move starts the clock again. The durable rule is pinned by
-/// [`m10_s2_b8_the_clock_starts_again_while_the_blamed_copy_advances`].
-/// Integration (~4 s): bootstrap's window, the hold, the resume hold.
+/// b8 (A-R282 N1), re-cut for the lagging clock (#79 Q1): node 3's links are held until node 1
+/// warns `copy_durable_lagging` for it and most of the drop clock has run, then healed. Node 3
+/// catches up, its durable sequence passes the floor it lagged, the lagging entry clears and
+/// the clock with it, so it is not dropped and writes go on with all three.
+/// The unreachable clock is set past the row, so only the lagging clock is in play.
+/// An advancing copy keeps clearing the clock: `Blame::next` starts it again at every durable
+/// step, for the lagging clock as for the paused one. In-process catch-up is one step, so this
+/// row cannot hold a copy advancing below its floor for longer than the clock; that rule is
+/// pinned by [`m10_s2_b8_the_clock_starts_again_while_the_blamed_copy_advances`].
+/// Cut: `warn_lagging` keeps an entry once its copy reaches the target, red (the lag never
+/// clears).
+/// Integration (~4 s): bootstrap's window, the hold to the Warn, 60% of the clock.
 #[config_log::retcd_test]
-#[ignore = "#79: no pause with one copy dead; re-cut for the lagging clock in #248"]
 fn m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped() {
     const METHOD: &str = "m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped";
     const CLOCK: u64 = 2 * DROP_AFTER_MILLIS;
@@ -548,25 +546,27 @@ fn m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped() {
     let (mut trio, before) = started(dir.path(), |host| {
         tuned(host);
         host.peer_drop_after_millis = CLOCK;
-        host.unreachable_drop_after_millis = CLOCK;
-        host.budgets.resume_hold_millis = CLOCK * 6 / 10;
+        host.unreachable_drop_after_millis = 30 * CLOCK;
     });
-    let held = trio.clock.now();
     hold_three(&trio);
-    let (request, _) = put_until_drop_planned(&mut trio, 1);
-    let paused = trio.clock.now();
+    let (mut request, _) = put_until_blamed(&mut trio, 1);
+    land_retrying(&mut trio, &mut request, 20);
     pass(&mut trio, CLOCK * 6 / 10);
-    let healed = trio.clock.now();
     trio.links.heal_all();
+    let warned = logged!(METHOD, "copy_durable_lagging");
+    let copy = warned
+        .iter()
+        .find(|line| line["holder"] == 3)
+        .map(|line| line["copy"].clone())
+        .unwrap_or_else(|| panic!("node 1 never warned node 3 lagging: {warned:?}"));
+    trio.until("node 3's lag cleared on node 1", |_| {
+        logged!(METHOD, "copy_durable_lag_cleared")
+            .iter()
+            .any(|line| line["copy"] == copy)
+            .then_some(())
+    });
+    pass(&mut trio, CLOCK);
     trio.ready();
-    let resumed = trio.clock.now();
-    // A-R438: past the paused clock, and short of the unreachable one. Both bounds lean against
-    // the row: `paused` is read after L1 paused, and the count starts at a check after the hold.
-    let unreachable_ms = HostClock::millis_until(held, healed);
-    let paused_ms = HostClock::millis_until(paused, resumed);
-    tracing::info!(unreachable_ms, paused_ms, clock = CLOCK, "b8_clocks");
-    assert!(unreachable_ms < CLOCK, "{unreachable_ms} ms unreachable");
-    assert!(paused_ms > CLOCK, "writes paused {paused_ms} ms only");
     assert_eq!(
         logged!(METHOD, "membership_drop_planned").len(),
         0,
@@ -576,6 +576,7 @@ fn m10_s2_b8_a_copy_catching_up_past_the_clock_is_not_dropped() {
         commit_of(&trio),
         Some((before, PartitionMode::Active, vec![1, 2, 3]))
     );
+    request += 1;
     match trio.ask(put(request)) {
         Answer::Txn { result, .. } => assert_eq!(result.generation, before),
         other => panic!("a put after the catch-up: {other:?}"),
@@ -2207,13 +2208,13 @@ fn m10_s2_b15_a_dropped_copy_that_restarts_is_added_back() {
 
     kill(&trio, 3, &[1, 2]);
     let (request, _) = put_until_drop_planned(&mut trio, 1);
-    trio.until("node 1 decided to drop node 3", |trio| {
-        matches!(
-            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
-            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
-                if replan.drop == Some(NodeId(3))
-        )
-        .then_some(())
+    // #79: the lagging clock drops node 3 with writes still landing, so the drop's re-plan can
+    // run to its commit inside the put that started it; its `rejoin_plan` line stays.
+    trio.until("node 1 decided to drop node 3", |_| {
+        logged!(METHOD, "rejoin_plan")
+            .iter()
+            .any(|line| line["dropped"] == "Some(3)")
+            .then_some(())
     });
     trio.links.heal_all();
     // Node 3 hears nothing, and is heard by nobody, until (e) heals it: a shadow that is behind.
@@ -10660,6 +10661,21 @@ fn t61_r3_a_copy_below_the_floor_of_a_promoted_rebuilt_copy_is_rebuilt_by_it() {
         .block_on(promote)
         .expect("the promote's task")
         .expect("the promote commits");
+    // Node 2 lands the promote's commit before its wiped restart. Restarted first, it is handed
+    // a commit pinning its old boot and faults on an inherit from a base it no longer holds
+    // (gate n1-249: `inherit_behind_cutoff`), which is not this row's subject.
+    let promoted = logged!(METHOD, "recovered")
+        .iter()
+        .rev()
+        .find(|line| line["node"] == 3)
+        .map(|line| line["generation"].clone())
+        .expect("node 3 logged the promote's recovered");
+    super::seal_tests::only_until(&mut trio, &[1, 2], "node 2 landed the promote", |_| {
+        logged!(METHOD, "recovered_landed")
+            .iter()
+            .any(|line| line["node"] == 2 && line["generation"] == promoted)
+            .then_some(())
+    });
     restart_as(&mut trio, dir.path(), 2, true);
     bind(&mut trio.nodes[1].0);
     let two = copy_of(&trio, 2);

@@ -3113,20 +3113,6 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
     // `PEER_DROP_AFTER_MILLIS` later, leaving two copies pinned.
     three.db.shutdown();
     drop(three);
-    let paused_by = std::time::Instant::now() + patience;
-    let mut landed = 0u32;
-    loop {
-        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
-            Ok(_) => landed += 1,
-            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
-            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
-        }
-        assert!(
-            std::time::Instant::now() < paused_by,
-            "writes never paused with node 3 away: {landed} landed"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let owner_pins = |one: &NodeProcess| -> Vec<(u32, rdb_core::contracts::ids::ReplicaRole)> {
         one.db
             .node_status()
@@ -3141,15 +3127,25 @@ fn m11_t12_c_a_rebuild_onto_a_spare_reaches_the_owner_in_another_process() {
             })
             .unwrap_or_default()
     };
+    // #79 option A: one copy of three away no longer pauses writes, so puts go on until the
+    // lagging clock drops node 3. A refusal that wrote nothing (the drop's re-plan: a pause,
+    // a lapsed lease, or an unactivated generation) is sent again under a fresh id.
     let pinned_by = std::time::Instant::now() + patience;
+    let mut landed = 0u32;
     while owner_pins(&one).len() != 2 {
+        match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
+            Ok(_) => landed += 1,
+            Err(e) if e.error.no_mutation => {}
+            Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
+        }
         assert!(
             std::time::Instant::now() < pinned_by,
-            "node 1 did not pin two copies with node 3 down: {:?}",
+            "node 1 did not pin two copies with node 3 down after {landed} puts: {:?}",
             owner_pins(&one)
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(landed >= 1, "no put landed with node 3 away");
 
     let app_links = Links::new();
     let app_net = {

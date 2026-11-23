@@ -11591,9 +11591,9 @@ mod tests {
 
     /// The done-when scenario of slice 2 (A-R278, A-R323), beside W5's row above: writes keep
     /// going while node 3 is away, then node 3 restarts and catches up from the live owner and
-    /// rejoins as a full copy. Node 3 is cut off both ways and puts go on through node 1 until
-    /// the owner pauses them for the unheard copy, at most 2,000. Node 3 restarts, its links
-    /// heal, node 1 re-plans with it, writes resume, and every write reads back. After shutdown,
+    /// rejoins as a full copy. Node 3 is cut off both ways and puts go on through node 1, every
+    /// one landing, until the owner warns that node 3 lags the durable floor (#79). Node 3
+    /// restarts, its links heal, node 1 re-plans with it, writes resume, and every write reads back. After shutdown,
     /// node 3's store holds node 1's generation through the same head with the same record
     /// digest there. No catch-up was refused and no rejoin abandoned. Cut: `restore_dormant`
     /// skips a node holding a primary, so node 1 sources nothing and node 3 never holds the
@@ -11626,7 +11626,7 @@ mod tests {
         );
     }
 
-    /// The two rows above: node 3 is cut off, puts go on until node 1 pauses, and node 3
+    /// The two rows above: node 3 is cut off, puts go on until node 1 warns it lags, and node 3
     /// restarts, after node 1 has dropped it when `drop_first`.
     fn away_then_rejoins(method: &'static str, drop_first: bool) {
         let dir = config_testkit::fs::temp_dir();
@@ -11655,31 +11655,29 @@ mod tests {
             db.links().drop_direction(NodeId(3), other);
             db.links().drop_direction(other, NodeId(3));
         }
+        // #79 option A: one copy of three away no longer pauses writes (the durable quorum
+        // floor goes on with nodes 1 and 2). Puts go on until node 1 warns that node 3 lags the
+        // floor (`copy_durable_lagging`, the lagging drop clock's start), and every one lands.
+        let warned = || {
+            config_testkit::logs::lines_for_current_test(module_path!(), method)
+                .iter()
+                .any(|line| line["@m"] == "copy_durable_lagging" && line["holder"] == 3)
+        };
         let mut landed = 0_u32;
-        let mut paused = false;
-        let paused_by = std::time::Instant::now() + patience;
-        while landed < 2_000 {
+        let warned_by = std::time::Instant::now() + patience;
+        loop {
             match db.put(format!("away-{landed}").as_bytes(), b"1", None) {
                 Ok(_) => landed += 1,
-                Err(refused) if refused.error.kind == ErrorKind::ProtectionPaused => {
-                    paused = true;
-                    break;
-                }
                 Err(refused) => panic!("a put with node 3 away, after {landed}: {refused:?}"),
             }
+            if landed.is_multiple_of(20) && warned() {
+                break;
+            }
             assert!(
-                std::time::Instant::now() < paused_by,
-                "{landed} puts in {patience:?} and no pause"
+                std::time::Instant::now() < warned_by,
+                "{landed} puts in {patience:?} with node 3 away and no copy_durable_lagging"
             );
         }
-        assert!(landed >= 1, "no put landed with node 3 away");
-        // A-R392: the loop ends on the pause, not the cap. 200 puts once landed in 370 ms, under
-        // the 400 ms pause age, and the pause went unchecked; 2,000 leaves room, and a budget
-        // that outlasts them is red.
-        assert!(
-            paused,
-            "{landed} puts landed with node 3 away and node 1 never paused"
-        );
         let before = of(&db, OWNER).recovered.expect("node 1 recovered");
         if drop_first {
             let dropped_by =
@@ -11839,6 +11837,8 @@ mod tests {
     /// brings the pause (A-R371), and the refusals still name the restart.
     /// Integration (~2 s): three node threads, one restart and its re-plan, a 400 ms pause budget.
     #[test]
+    #[ignore = "#79: one held copy of three no longer pauses (the put is durable on 1 and 2), \
+                and a `Db` row has no flush hold to make a published put unsafe; re-cut in #248"]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
