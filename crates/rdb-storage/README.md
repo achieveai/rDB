@@ -36,7 +36,8 @@ is refused at open (exit 6).
   (review-s2 F-006, A-R411), logged `format_marker_moved_for_ack_floor`.
 - Possible-loss marker (format 3, #177): `metadata` key `possible` + partition u32 BE, the
   promoted generation, the seq the copy held and the cause. Written in the same batch as the
-  generation switch, synced (`inherit_marked`); cleared by `clear_possible_loss`. A format-2
+  generation switch by `inherit_marked`. The batch is unsynced until the WAL sync completes.
+  `clear_possible_loss` clears the record with a synced write. A format-2
   build does not define it, so the batch that writes it on an older copy writes marker 3.
 - A new key needs a `FORMAT_VERSION` bump. This build refuses a short `metadata` key it
   does not define (A-R184), so a copy holding a newer build's key would not open here.

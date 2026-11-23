@@ -2478,11 +2478,10 @@ impl Db {
         // #80 S2 (ADR-rdb-0024): an app open of a declared database is held to the same
         // control-TLS rule as a node open, by the same nodes/ records, before it reads or
         // counts anything.
-        if admin::read_formation(&*store)
+        let formation = admin::read_formation(&*store)
             .await
-            .map_err(formation_refused)?
-            .is_some()
-        {
+            .map_err(formation_refused)?;
+        if formation.is_some() {
             let records = admin::read_nodes(&*store).await.map_err(nodes_refused)?;
             if let Some(why) = admin::control_tls_refusal(
                 records
@@ -2530,6 +2529,8 @@ impl Db {
             restart_hold: Mutex::new(None),
             unwind: None,
             opened: Opened {
+                nodes: formation
+                    .map_or_else(|| ALL_NODES.into(), |formation| formation.nodes.into()),
                 control: Some(PromoteStore(Arc::clone(&store), rt.clone(), budgets)),
                 ..Opened::default()
             },
@@ -8078,8 +8079,9 @@ impl Db {
     /// group has been re-checked. Writes are never blocked by the record, so nothing waits on
     /// this.
     ///
-    /// First every node that may hold a record is read: each node of this process, and the
-    /// owner and the members it pins, over the links ([`Self::possible_loss_holders`]). The ack
+    /// Discovery reads each local node, the owner and its pinned members. When those reads
+    /// find no marker it checks the remaining formation and registered nodes, including
+    /// removed nodes ([`Self::possible_loss_holders`]), before reporting absence. The ack
     /// then goes to the holder whose record names `generation`, else to any holder, whose own
     /// generation check refuses it; with no holder, to the owner. That node checks the
     /// generation again against its own store, and the clear is one synced write.
@@ -8092,9 +8094,10 @@ impl Db {
     /// owner, naming it: the ack is run from that node's process (a holder-targeted ack is
     /// #245); `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the
     /// node does not list as an admin app; `UNAVAILABLE`, nothing cleared, when a node that may
-    /// hold a record cannot be read or did not answer in the read timeout, or the ack was not
-    /// answered; a host error when a node cannot read its record. No record standing on any
-    /// node read is `Ok`.
+    /// hold a record cannot be checked or discovery times out. A lost answer after dispatch
+    /// leaves the clear outcome unknown: read status or retry the same generation. A local
+    /// storage read failure is a host error. If all possible holders report absence, the
+    /// owner's idempotent ack is `Ok`.
     pub fn ack_possible_loss(&self, generation: Generation) -> Result<(), ApiError> {
         if let Some(error) =
             self.refuse_groupless("ack_possible_loss", "it runs on one partition only")
@@ -8159,9 +8162,10 @@ impl Db {
     }
 
     /// #177 (PR #238 review): partition 1's possible-loss records on the nodes that may hold
-    /// one: each node of this process, read on its own thread ([`Msg::PossibleLossOf`]), then
-    /// the owner and the members its status pins, over the links. A record on a node outside
-    /// those (a former member) is not found: #245.
+    /// one: each local node, the owner and its pinned members first. Before an empty ack,
+    /// also check original formation IDs and the durable registry, including removed nodes
+    /// whose IDs rDB never reuses. A registered node whose status cannot be read leaves
+    /// absence unknown. Externally deleting a node's registry record is unsupported.
     ///
     /// # Errors
     ///
@@ -8223,14 +8227,74 @@ impl Db {
             .collect();
         remote.sort_unstable();
         remote.dedup();
-        for node in remote {
+        let inspect = |node, deadline| {
             let status = self
-                .look(node)
+                .look_by(PARTITION, node, read, deadline)
                 .map_err(|_| unknown(node, "did not answer its status look"))?;
             if let Some(error) = status.possible_loss_error {
                 return Err(unknown(node, &error));
             }
-            holders.extend(status.possible_loss);
+            Ok(status.possible_loss)
+        };
+        for &node in &remote {
+            holders.extend(inspect(node, None)?);
+        }
+        if holders.is_empty() {
+            let deadline = Instant::now() + read;
+            // A single complete list sees live records and removal tombstones at one revision.
+            // Declared clusters can add nodes after formation. Undeclared clusters have no
+            // registry and retain the fixed original formation in opened.nodes.
+            let mut candidates = self
+                .control_read(
+                    "possible-loss holder registry",
+                    deadline,
+                    |store| async move {
+                        let listed = admin::list_whole(&*store, ControlPrefix::Nodes)
+                            .await
+                            .map_err(|error| {
+                                RouteReadError::Unavailable(format!(
+                                    "list possible-loss holders: {error}"
+                                ))
+                            })?;
+                        listed
+                            .records
+                            .iter()
+                            .map(|record| {
+                                let key = String::from_utf8_lossy(&record.key);
+                                match ControlKey::decode(&key) {
+                                    Ok(ControlKey::Node(node)) => Ok(node),
+                                    _ => Err(RouteReadError::Undecodable(format!(
+                                        "invalid possible-loss holder key {key}"
+                                    ))),
+                                }
+                            })
+                            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                    },
+                )
+                .map_err(|mut error| {
+                    error.detail.push_str(
+                        "; possible-loss holder discovery is incomplete: nothing was cleared",
+                    );
+                    error.no_mutation = true;
+                    error
+                })?;
+            candidates.extend(self.opened.nodes.iter().copied());
+            candidates.remove(&owner);
+            for node in local.iter().chain(&remote) {
+                candidates.remove(node);
+            }
+            for node in candidates {
+                if Instant::now() >= deadline {
+                    return Err(unknown(
+                        node,
+                        "could not be checked before the discovery deadline",
+                    ));
+                }
+                if let Some(loss) = inspect(node, Some(deadline))? {
+                    holders.push(loss);
+                    break;
+                }
+            }
         }
         Ok((owner, holders))
     }
@@ -14653,6 +14717,90 @@ mod tests {
                     && error.detail.contains("marker read failed")
                     && error.detail.contains("nothing was cleared"),
                 "{error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn pr238_app_checks_an_unpinned_registered_holder_before_reporting_an_empty_ack() {
+        let (mut db, _, _rt) = unanswered(Duration::from_millis(20));
+        lock(&db.nodes).clear();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let former = NodeId(7);
+        let record = rdb_core::authority::node::NodeRecord {
+            node: former,
+            addr: "127.0.0.1:7".into(),
+            machine: "seven".into(),
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(ControlKey::Node(former).encode()),
+            value: record.encode_removed(None),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("tombstone for a runtime-added former member");
+        db.opened.control = Some(PromoteStore(
+            store,
+            rt.handle().clone(),
+            Budgets::SPEC_DEFAULTS,
+        ));
+        db.opened.nodes = vec![OWNER].into();
+        let (one, owner) = mpsc::channel();
+        db.links.register(OWNER, one, host::BOOT);
+        let (seven, old) = mpsc::channel();
+        db.links.register(former, seven, host::BOOT);
+        std::thread::scope(|scope| {
+            let owner = scope.spawn(move || {
+                let mut acks = 0;
+                while let Ok(msg) = owner.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(replan_status(false));
+                        }
+                        Msg::Client(Client { reply, .. }) => {
+                            acks += 1;
+                            let _ = reply.send(Answer::PossibleLossAcked("no record".into()));
+                        }
+                        _ => {}
+                    }
+                }
+                acks
+            });
+            scope.spawn(move || {
+                for standing in [true, false] {
+                    let Ok(Msg::Inspect { reply, .. }) = old.recv() else {
+                        return;
+                    };
+                    let mut status = replan_status(false);
+                    status.node = former;
+                    status.possible_loss = standing.then_some(host::PossibleLoss {
+                        copy: former,
+                        generation: Generation(4),
+                        applied: 3,
+                        reason: host::PossibleLossReason::OsBootChanged,
+                    });
+                    let _ = reply.send(status);
+                }
+                // No link on the third attempt: absence can no longer be established.
+            });
+            let first = db.ack_possible_loss(Generation(4));
+            let second = db.ack_possible_loss(Generation(4));
+            let third = db.ack_possible_loss(Generation(4));
+            drop(db);
+            assert!(
+                matches!(first, Err(ref e) if e.kind == ErrorKind::InvalidArgument && e.detail.contains("stands on node 7")),
+                "{first:?}"
+            );
+            assert_eq!(second, Ok(()));
+            assert!(
+                matches!(third, Err(ref e) if e.kind == ErrorKind::Unavailable && e.detail.contains("node 7") && e.detail.contains("nothing was cleared")),
+                "{third:?}"
+            );
+            assert_eq!(
+                owner.join().expect("owner"),
+                1,
+                "only the proven empty ack was dispatched"
             );
         });
     }

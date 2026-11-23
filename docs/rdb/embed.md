@@ -511,7 +511,12 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
     failovers. The WARN is logged once when the promote is chosen and again at each open
     while the record stands. `admin promote` by hand stores none.
   - The ack clears it only for its own generation: another number is `INVALID_ARGUMENT` and
-    clears nothing, so a stale ack cannot clear a newer record. No record standing is `Ok`.
+    clears nothing, so a stale ack cannot clear a newer record. Before reporting that no record
+    stands, the ack checks the formation nodes and the durable `nodes/` registry, including
+    removal tombstones. An unreachable former member leaves the result unknown and no ack is
+    sent. A missing reply after dispatch leaves the clear outcome unknown. Read node status
+    or retry the same generation. Discovery assumes the registry has been maintained by rDB;
+    manual deletion of historical node records is unsupported.
     Only an admin app may ack, as for `forget_tail`. It logs INFO
     `failover_possible_loss_acked`. One partition only in this release: the ack is refused
     above one partition.
@@ -1902,8 +1907,8 @@ above comes back by itself once its link is back:
 - **Mixed builds.** This build speaks the wire version in `PROTOCOL_VERSION` (14 at this commit:
   10 brought these guards, 11 issue #61's snapshot wire, 12 #147 and #148's delete and list, 13
   #244's membership revision and refill call, and 14 #238's possible-loss ack, status and restored holdings), whether or not this setting is on. A
-  build before these guards speaks 9, even one that has this setting, and a build at 10, 11 or 12
-  lacks the snapshot wire, the delete and list, or S4's fields. A build at another version and this one refuse each other when they
+  build before these guards speaks 9, even one that has this setting, and builds at 10 through 13
+  lack one or more later changes. Protocol 13 lacks the possible-loss call, answer, and status fields. A build at another version and this one refuse each other when they
   connect, each logging `net_handshake_refused` with both versions. So an older node is never
   added back live, and it cannot link at all. The same holds for an app process with no copy
   (`--nodes`): an app at an older version is refused by nodes at 14. To upgrade: stop every

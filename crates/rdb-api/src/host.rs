@@ -1808,8 +1808,8 @@ pub struct PossibleLoss {
     /// The generation that promote committed. `Db::ack_possible_loss` must name it.
     pub generation: Generation,
     /// Where that generation starts: the promoted copy's applied seq when the promote landed
-    /// on it. A write acknowledged at or below it may be lost; one above it was written under
-    /// the new generation and is not in question.
+    /// on it. Re-check writes acknowledged before the failover at seqs above this point:
+    /// the promoted copy may lack them.
     pub applied: u64,
     /// Why.
     pub reason: PossibleLossReason,

@@ -6278,7 +6278,7 @@ fn node_line(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
     };
     format!(
         "node={} boot={} {} authority={} recovery={} recovered={} role={} l1={} admits={} mode=? \
-         roles=?{published}{}{}{}",
+         roles=?{published}{}{}{}{}",
         node.node.0,
         node.boot.0,
         holds_part(node),
@@ -6302,6 +6302,9 @@ fn node_line(node: &NodeStatus, owner: Option<&NodeStatus>) -> String {
             loss.applied,
             loss.reason.as_str()
         )),
+        node.possible_loss_error
+            .as_ref()
+            .map_or_else(String::new, |why| format!(" possible_loss_error={why}")),
     )
 }
 
@@ -7088,6 +7091,8 @@ mod tests {
         node.possible_loss = None;
         let line = node_line(&node, None);
         assert!(!line.contains("possible_loss="), "{line}");
+        node.possible_loss_error = Some("marker read failed".into());
+        assert!(node_line(&node, None).contains(" possible_loss_error=marker read failed"));
     }
 
     /// Bug bash #65: after `rebuilt: node 3 ...` the poller still said "writes pause soon ...
