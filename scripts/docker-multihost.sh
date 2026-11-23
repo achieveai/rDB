@@ -1720,6 +1720,25 @@ remove_node() {
     say "remove $n: $line. Its copies come back with rebalance"
 }
 
+# A11's verdict (PR #244 review): 0 only when the restarted node was ready (READY_RC 0) and a
+# start_peer_removed_skipped line on stdin names the removed node as its peer.
+a11_rc() { # ready rc, removed node; the node's start_peer_removed_skipped lines on stdin
+    local logged=1
+    grep -q "\"peer\":${2}[,}]" && logged=0
+    [ "$1" = 0 ] && [ "$logged" = 0 ]
+}
+
+# A11 on node V, whose --peers names removed node R: restart V, then judge it.
+a11_node() { # node, removed node
+    local v="$1" r="$2" since rc
+    since="$(date +%s)"
+    docker restart "$NAME-d$v" > /dev/null
+    node_ready_since "$v" "$since" 60; rc=$?
+    a11_rc "$rc" "$r" < <(docker exec "$NAME-d$v" sh -c 'grep -rh start_peer_removed_skipped /data/logs' 2>/dev/null)
+    rc=$?
+    verdict "A11 node $v, its --peers naming removed node $r, restarted ready and logged start_peer_removed_skipped peer=$r" "$rc"
+}
+
 # check-members: D2's A1 to A11 (arch-80-s34 D2). A1-A7 read the rig; A8, A11, A10 and A9, in
 # that order, change it, so a rig is judged once.
 check_members() {
@@ -1803,12 +1822,7 @@ PY
     # A11 (S-4): d3, whose --peers still names the removed node, restarts and skips it.
     v=3; [ "$(node_state 3)" = live ] || v="$(live_ids | awk -v k="$NODES" '$1 <= k' | head -n 1)"
     if [ -n "$r" ] && [ -n "$v" ] && [ "$r" -le "$NODES" ]; then
-        local since; since="$(date +%s)"
-        docker restart "$NAME-d$v" > /dev/null
-        node_ready_since "$v" "$since" 60; rc=$?
-        docker exec "$NAME-d$v" sh -c 'grep -rh start_peer_removed_skipped /data/logs' 2>/dev/null \
-            | grep -q "\"peer\":${r}[,}]" || rc=1
-        verdict "A11 node $v, its --peers naming removed node $r, restarted ready and logged start_peer_removed_skipped peer=$r" $?
+        a11_node "$v" "$r"
     else
         verdict "A11 a node up started, and a removed node it names in --peers (v=${v:-none}, r=${r:-none})" 1
     fi
@@ -2793,6 +2807,26 @@ SH
         && ! grep -q "admin remove-node" "$t/calls"
     st "remove stops when the stopped container was restarted (exit $rc)" $?
     rm -f "$t/calls.stopped"
+    # A11: green only when the node was ready and logged the skip of the removed peer.
+    local skip='{"@m":"start_peer_removed_skipped","peer":2}' other='{"@m":"start_peer_removed_skipped","peer":12}'
+    a11_rc 0 2 <<< "$skip"; st "A11 passes when ready and the skip of peer 2 is logged" $?
+    fails a11_rc 1 2 <<< "$skip"; st "A11 fails when not ready, though the skip is logged" $?
+    fails a11_rc 0 2 < /dev/null; st "A11 fails when ready but no skip is logged" $?
+    fails a11_rc 1 2 < /dev/null; st "A11 fails when neither ready nor logged" $?
+    fails a11_rc 0 2 <<< "$other"; st "A11 fails when the only skip names another peer (12)" $?
+    # ... and check-members' A11 step passes that judgement to its verdict, for each pair.
+    local ready logged want seen
+    for ready in 0 1; do
+        for logged in "$skip" ""; do
+            want=FAIL; [ "$ready" = 0 ] && [ -n "$logged" ] && want=PASS
+            seen="not logged"; [ -z "$logged" ] || seen=logged
+            out="$( docker() { [ "$1" = exec ] && [ -n "$logged" ] && echo "$logged"; return 0; }
+                    node_ready_since() { return "$ready"; }
+                    NAME=rdbst-s4 FAILS=0; a11_node 3 2 )"
+            [ "${out%% *}" = "$want" ]; rc=$?
+            st "A11's verdict is $want for ready rc $ready, skip $seen (got ${out%% *})" "$rc"
+        done
+    done
     # A rig from before S4 (no nodes.txt) is refused by every command that loads it.
     sed -i 's/nodes.txt) printf.*/nodes.txt) exit 1 ;;/' "$t/bin/docker"
     PATH="$t/bin:$PATH" CALLS="$t/calls" "$0" rebalance --name rdbst-s4 > "$t/out" 2>&1; rc=$?
