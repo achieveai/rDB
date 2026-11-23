@@ -11290,6 +11290,42 @@ fn t61_r3_a_copy_below_the_floor_of_a_promoted_rebuilt_copy_is_rebuilt_by_it() {
     assert_eq!(opened[0]["copy"], two.0, "{opened:?}");
 }
 
+/// #250: H3's `copy_ahead` re-posts the committed root to a member that answers it is behind,
+/// but not to one whose link reports a boot other than the one the root pins. Such a member
+/// restarted since, possibly on an empty disk (t61_r3, red 2 of 4 on #249 with
+/// `inherit_behind_cutoff`), and its restart is the owner's re-plan to handle. The control: at
+/// the pinned boot the root is re-posted. Then node 3's link reports boot 2, with no
+/// `PeerBooted` yet, and nothing is re-posted.
+/// Cut: no boot check in `copy_ahead`, red (a second `copy_ahead_reposted`).
+/// Integration (~1 s): bootstrap's window, two direct calls.
+#[config_log::retcd_test]
+fn i250_copy_ahead_re_posts_nothing_to_a_member_that_restarted_since_it_was_pinned() {
+    const METHOD: &str =
+        "i250_copy_ahead_re_posts_nothing_to_a_member_that_restarted_since_it_was_pinned";
+    let dir = config_testkit::fs::temp_dir();
+    let (trio, _) = started(dir.path(), tuned);
+    let three = copy_of(&trio, 3);
+    let mut trio = trio;
+    trio.nodes[0].0.copy_ahead(PartitionId(1), three);
+    let reposted = logged!(METHOD, "copy_ahead_reposted");
+    assert_eq!(reposted.len(), 1, "control: {reposted:?}");
+    assert_eq!(reposted[0]["member"], 3, "{reposted:?}");
+
+    let reboot = BootId(trio.nodes[2].0.boot.0 + 1);
+    let mailbox = trio.nodes[2].1.clone();
+    trio.links.register(NodeId(3), mailbox, reboot);
+    trio.nodes[0].0.copy_ahead(PartitionId(1), three);
+    let reposted = logged!(METHOD, "copy_ahead_reposted");
+    assert_eq!(
+        reposted.len(),
+        1,
+        "re-posted to a rebooted member: {reposted:?}"
+    );
+    let skipped = logged!(METHOD, "copy_ahead_rebooted");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0]["boot"], reboot.0, "{skipped:?}");
+}
+
 /// A begun install that expires is aborted. No production route is
 /// known to a snapshot ask from a copy that R1 can still reach with a contiguous record, so
 /// the ask is forced: copy 3 is above node 1's floor here. Every copy holds the 30 puts, trimmed to
