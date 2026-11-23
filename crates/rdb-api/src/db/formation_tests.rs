@@ -3421,7 +3421,12 @@ fn r5_b2_an_expired_grant_of_b1_and_a_returning_b2_with_its_heal_blocked_is_pinn
         "node 2 still waits for node {} past its grant: {waited:?}",
         copy.0
     );
-    assert!(now_ms() > past, "C's grant has expired");
+    let observed = now_ms();
+    // Reaching this millisecond already includes the clock margins and the full extra second.
+    assert!(
+        observed >= past,
+        "C's grant has expired: observed_ms={observed}, past_ms={past}, expiry_ms={expiry}"
+    );
     rig.restart(copy, Timeouts::default());
     // Review round 4: the boot C runs now, and the one node 2 pins it at.
     let b2 = rig.of(copy).boot_of(copy).expect("C runs");
@@ -3562,7 +3567,12 @@ fn r5_link_a_running_b2_whose_link_comes_back_is_pinned_at_b2() {
         "node 2 still waits for node {} once b1's grant has expired: {waited:?}",
         copy.0
     );
-    assert!(now_ms() > past, "b1's grant has expired");
+    let observed = now_ms();
+    // Reaching this millisecond already includes the clock margins and the full extra second.
+    assert!(
+        observed >= past,
+        "b1's grant has expired: observed_ms={observed}, past_ms={past}, expiry_ms={expiry}"
+    );
     assert!(
         !owner_linked(&rig, copy),
         "node 2 has no link to C while C is muted"
