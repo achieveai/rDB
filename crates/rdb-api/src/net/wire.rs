@@ -2297,6 +2297,8 @@ pub struct WireNodeStatus {
     pub members_revision: Option<u64>,
     /// Added with #177's protocol version: the partition's possible-loss record on this node.
     pub possible_loss: Option<WirePossibleLoss>,
+    /// Protocol 14: why the node could not read its possible-loss record.
+    pub possible_loss_error: Option<String>,
 }
 
 /// [`crate::host::TailRefused`] on the wire.
@@ -2413,6 +2415,7 @@ impl From<&NodeStatus> for WireNodeStatus {
                     adoption_reason,
                 }
             }),
+            possible_loss_error: status.possible_loss_error.clone(),
             possible_loss: status.possible_loss.map(|loss| WirePossibleLoss {
                 copy: loss.copy,
                 generation: loss.generation,
@@ -2487,6 +2490,7 @@ impl TryFrom<WireNodeStatus> for NodeStatus {
             needs_operator: status.needs_operator,
             lengths: None,
             members_revision: status.members_revision,
+            possible_loss_error: status.possible_loss_error,
             possible_loss: status.possible_loss.map(|loss| crate::host::PossibleLoss {
                 copy: loss.copy,
                 generation: loss.generation,

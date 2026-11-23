@@ -754,6 +754,7 @@ fn status() -> NodeStatus {
             NodeId(3),
             rdb_core::contracts::ids::Seq(9),
         )),
+        possible_loss_error: None,
         members_revision: Some(41),
     }
 }
@@ -959,7 +960,7 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         head: Seq(1),
     }));
     assert_eq!(index(&page), 10);
-    // #177: the ack's call and answer went last, after the feed's.
+    // #177: the ack's call and answer went last, after #244's refill and the feed answer.
     let acked = WireAnswer::carry(&Answer::PossibleLossAcked(String::new()));
     assert_eq!(index(&acked), 11);
     let call = wire::WireCall::try_from(&ClientCall::Changes {
@@ -981,7 +982,14 @@ fn every_message_kind_crosses_the_wire_unchanged() {
         identity: identity(1, 3),
         generation: Generation(1),
     };
-    assert_eq!(call_index(&ack), 11);
+    assert_eq!(
+        call_index(&wire::WireCall::Refill {
+            identity: identity(1, 4),
+            to: NodeId(2)
+        }),
+        11
+    );
+    assert_eq!(call_index(&ack), 12);
 
     let status = status();
     let bytes = wire::encode(&Frame::Reply {

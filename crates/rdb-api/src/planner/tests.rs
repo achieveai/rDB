@@ -61,6 +61,7 @@ fn status(node: u32, holds: Option<(u64, u64)>) -> NodeStatus {
         tail_refused: None,
         possible_loss: None,
         needs_operator: None,
+        possible_loss_error: None,
         members_revision: None,
     }
 }

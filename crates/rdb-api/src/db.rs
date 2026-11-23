@@ -3773,6 +3773,17 @@ impl Db {
                 phase,
             }
         };
+        let mut checking_replan = false;
+        let refresh = |partition, checking_replan| {
+            if checking_replan {
+                self.refresh_owners_by(
+                    &[partition],
+                    deadline.min(Instant::now() + self.timeouts.read),
+                );
+            } else {
+                self.refresh_owner(partition);
+            }
+        };
         loop {
             // PR #238 review: a re-plan seen on an owner `partitions/{p}` no longer names (it
             // moved, perhaps to a node that cannot be reached) is not this partition's answer.
@@ -3788,21 +3799,29 @@ impl Db {
             if let Some(note) = self.restart_note().filter(|_| self.owner_restarted()) {
                 return Err(ReadyError::Stopped { note });
             }
-            let looked = self.look_in(partition, self.route.owner_of(partition));
+            if checking_replan && Instant::now() >= deadline {
+                break;
+            }
+            let looked = self.look_by(
+                partition,
+                self.route.owner_of(partition),
+                self.timeouts.read,
+                checking_replan.then_some(deadline),
+            );
             if looked == Err(Unlooked::NoLink) {
                 // What is known now: the owner is not reachable, whatever an earlier look saw.
                 NO_LINK.clone_into(&mut phase);
                 // A promote may have moved the partition away from it (bug bash #64): read the
                 // owner again, at most once per `OWNER_REREAD_GAP`, so the next look asks the
                 // owner `partitions/1` names now.
-                self.refresh_owner(partition);
+                refresh(partition, checking_replan);
             }
             if looked == Err(Unlooked::NoAnswer) {
                 // A silent owner (paused, hung, or cut with its sockets open) keeps its link up
                 // and answers nothing, so it gives neither signal around this one. Read the
                 // owner again, within `OWNER_REREAD_GAP`, so a promote that moved the partition
                 // away from it is followed (#80 S3).
-                self.refresh_owner(partition);
+                refresh(partition, checking_replan);
             }
             if let Ok(owner) = looked {
                 if owner.admits == Some(true) {
@@ -3821,7 +3840,7 @@ impl Db {
                 // It answered without admitting: a resumed old owner stays this way after a
                 // promote it never heard of (PR #102 review). Read the owner again, within
                 // `OWNER_REREAD_GAP`, and look at the owner `partitions/{p}` names now.
-                self.refresh_owner(partition);
+                refresh(partition, checking_replan);
                 if self.route.owner_of(partition) != owner.node {
                     // PR #102 review, round 2: a new owner found after `within` does not get
                     // another look; the call has run out of time like any other.
@@ -3854,6 +3873,7 @@ impl Db {
                         if let HealState::Failed(error) = &*lock(&self.opened.heal) {
                             return Err(ReadyError::Heal(error.clone()));
                         }
+                        checking_replan = true;
                         match self.boot_replan_look(partition, node, deadline) {
                             // No answer in the time left: not known to be final. Waited on to
                             // the bound, then the retryable `TimedOut` (PR #238 review).
@@ -3928,19 +3948,23 @@ impl Db {
                 }
                 phase = owner.recovery.unwrap_or_else(|| NO_RECOVERY.to_owned());
             }
-            if std::time::Instant::now() >= deadline {
-                // #202: the boot re-plan did not land within the bound: its block is final.
-                if let Some((node, reason)) = replanning {
-                    tracing::warn!(owner = node.0, reason, "ready_blocked");
-                    return Err(ReadyError::Blocked {
-                        owner: node,
-                        reason,
-                    });
-                }
-                return Err(timed_out(partition, phase));
+            if Instant::now() >= deadline {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(
+                Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
+        if let Some((node, reason)) = replanning {
+            if self.route.owner_of(partition) == node {
+                tracing::warn!(owner = node.0, reason, "ready_blocked");
+                return Err(ReadyError::Blocked {
+                    owner: node,
+                    reason,
+                });
+            }
+        }
+        Err(timed_out(partition, phase))
     }
 
     /// #202: `node`'s status for `partition` and whether it is re-planning it at a restarted
@@ -6975,11 +6999,34 @@ impl Db {
         node: NodeId,
         within: Duration,
     ) -> Result<NodeStatus, Unlooked> {
+        self.look_by(partition, node, within, None)
+    }
+
+    fn look_by(
+        &self,
+        partition: PartitionId,
+        node: NodeId,
+        within: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<NodeStatus, Unlooked> {
         let (reply, answer) = mpsc::channel();
-        self.send_to(node, Msg::Inspect { partition, reply })
-            .map_err(|_| Unlooked::NoLink)?;
+        let msg = Msg::Inspect { partition, reply };
+        let left = || {
+            deadline.map_or(within, |end| {
+                within.min(end.saturating_duration_since(Instant::now()))
+            })
+        };
+        match deadline {
+            Some(_) => self
+                .send_to_within(node, msg, left())
+                .map_err(|why| match why {
+                    Unsent::Restarting => Unlooked::NoAnswer,
+                    Unsent::Stopped => Unlooked::NoLink,
+                })?,
+            None => self.send_to(node, msg).map_err(|_| Unlooked::NoLink)?,
+        }
         let status = answer
-            .recv_timeout(within)
+            .recv_timeout(left())
             .map_err(|_| Unlooked::NoAnswer)?;
         if partition == PARTITION && node == self.route.owner() {
             // review-s2 F-005: an owner in another process is not ended by a blocked recovery;
@@ -8054,7 +8101,7 @@ impl Db {
         {
             return Err(error);
         }
-        let holders = self.possible_loss_holders()?;
+        let (owner, holders) = self.possible_loss_holders()?;
         let call = ClientCall::AckPossibleLoss {
             identity: self.identity(),
             generation,
@@ -8064,16 +8111,10 @@ impl Db {
             .find(|loss| loss.generation == generation)
             .or_else(|| holders.first());
         let answer = match target {
-            Some(loss) if self.runs(loss.copy) => {
-                match self.send_call(loss.copy, PARTITION, call) {
-                    Ok(answer) => answer.recv_timeout(self.timeouts.read).ok(),
-                    Err(NodeStopped(node)) => Some(Answer::Error {
-                        error: ApiError::host(&format!("node {} has stopped", node.0)),
-                        request: None,
-                    }),
-                }
-            }
-            Some(loss) if loss.copy != self.route.owner() => {
+            Some(loss)
+                if !self.runs(loss.copy)
+                    && (loss.copy != owner || loss.copy != self.route.owner()) =>
+            {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
                     format!(
@@ -8084,7 +8125,18 @@ impl Db {
                     ),
                 ));
             }
-            _ => self.call(PARTITION, call, self.timeouts.read),
+            _ => {
+                // A retry must rediscover the record. Never resend this ack to a new owner.
+                let node = target.map_or(owner, |loss| loss.copy);
+                let answer = self.send_call(node, PARTITION, call).map_err(|_| {
+                    if self.runs(node) {
+                        ApiError::host(&format!("node {} has stopped", node.0))
+                    } else {
+                        ApiError::owner_unreachable(node)
+                    }
+                })?;
+                answer.recv_timeout(self.timeouts.read).ok()
+            }
         };
         match answer {
             Some(Answer::PossibleLossAcked(line)) => {
@@ -8116,7 +8168,7 @@ impl Db {
     /// `UNAVAILABLE` when one of them did not answer in the read timeout, or cannot be reached;
     /// a host error when a node of this process cannot read its record. Whether a record
     /// stands there is then unknown, so nothing may be cleared on the strength of "none".
-    fn possible_loss_holders(&self) -> Result<Vec<host::PossibleLoss>, ApiError> {
+    fn possible_loss_holders(&self) -> Result<(NodeId, Vec<host::PossibleLoss>), ApiError> {
         let unknown = |node: NodeId, why: &str| {
             ApiError::new(
                 ErrorKind::Unavailable,
@@ -8155,6 +8207,9 @@ impl Db {
         let pinned = match self.look(owner) {
             Ok(status) => {
                 if !self.runs(owner) {
+                    if let Some(error) = status.possible_loss_error {
+                        return Err(unknown(owner, &error));
+                    }
                     holders.extend(status.possible_loss);
                 }
                 status.pinned
@@ -8172,9 +8227,12 @@ impl Db {
             let status = self
                 .look(node)
                 .map_err(|_| unknown(node, "did not answer its status look"))?;
+            if let Some(error) = status.possible_loss_error {
+                return Err(unknown(node, &error));
+            }
             holders.extend(status.possible_loss);
         }
-        Ok(holders)
+        Ok((owner, holders))
     }
 
     /// M11: the owner this `Db` routes to, and the members its commit pins, as it answers its
@@ -13793,6 +13851,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         // D17: timed from the first look node 1 answered in time, as the quarantined row below
@@ -13893,6 +13952,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         // Node 1 in another process: reached over the links, and no handle of it in this `Db`.
@@ -13998,6 +14058,7 @@ mod tests {
             committed_without: rdb_core::contracts::recovery::NoteState::Unknown,
             tail_refused: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
             possible_loss: None,
         }
@@ -14538,6 +14599,158 @@ mod tests {
         assert_eq!(acks.load(Ordering::Relaxed), 0, "no ack was sent");
     }
 
+    #[test]
+    fn pr238_app_refuses_ack_when_pinned_remote_marker_read_failed() {
+        use crate::net::wire::{self, Frame, WireNodeStatus, WireReply};
+        let (db, _, _rt) = unanswered(Duration::from_millis(20));
+        lock(&db.nodes).clear();
+        let (one, owner) = mpsc::channel();
+        let (two, former) = mpsc::channel();
+        db.links.register(OWNER, one, host::BOOT);
+        db.links.register(NodeId(2), two, host::BOOT);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let Msg::Inspect { reply, .. } = owner.recv().expect("owner look") else {
+                    panic!("expected Inspect")
+                };
+                let mut status = replan_status(false);
+                status.pinned = vec![member(2)];
+                reply.send(status).expect("owner reply");
+                if let Ok(Msg::Client(Client { reply, .. })) = owner.recv() {
+                    let _ = reply.send(Answer::PossibleLossAcked("no record".into()));
+                    panic!("ack reached the unmarked owner");
+                }
+            });
+            scope.spawn(move || {
+                let Msg::Inspect { reply, .. } = former.recv().expect("holder look") else {
+                    panic!("expected Inspect")
+                };
+                let mut status = replan_status(false);
+                status.node = NodeId(2);
+                status.possible_loss_error = Some("marker read failed".into());
+                let bytes = wire::encode(&Frame::Reply {
+                    correlation: 1,
+                    reply: WireReply::Status(Box::new(WireNodeStatus::from(&status))),
+                });
+                let Frame::Reply {
+                    reply: WireReply::Status(back),
+                    ..
+                } = wire::decode(&bytes).expect("status frame")
+                else {
+                    panic!("expected Status")
+                };
+                reply
+                    .send(NodeStatus::try_from(*back).expect("status"))
+                    .expect("holder reply");
+            });
+            let error = db
+                .ack_possible_loss(Generation(4))
+                .expect_err("uncertain marker");
+            drop(db);
+            assert_eq!(error.kind, ErrorKind::Unavailable);
+            assert!(
+                error.detail.contains("node 2")
+                    && error.detail.contains("marker read failed")
+                    && error.detail.contains("nothing was cleared"),
+                "{error:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn pr238_app_never_retries_a_discovered_owners_ack_on_the_replacement() {
+        let (mut db, _, _rt) = unanswered(Duration::from_millis(20));
+        lock(&db.nodes).clear();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let record = PartitionRecord {
+            partition: PARTITION,
+            owner: NodeId(2),
+            generation: Generation(5),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(5),
+            config_version: admin::CONFIG_VERSION,
+            lifecycle: rdb_core::authority::partition::PartitionLifecycle::Serving,
+        };
+        let root = PartitionRoot {
+            mode: rdb_core::authority::partition::RecordMode::Active,
+            owner_boot: host::BOOT,
+            base_seq: Seq(0),
+            base_digest: rdb_core::contracts::digest::Digest::ROOT,
+            predecessor_generation: Generation(4),
+            predecessor_cutoff: Seq(0),
+            instance: [7; INSTANCE_LEN],
+            run: rdb_core::contracts::ids::Revision(1),
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(ControlKey::Partition(PARTITION).encode()),
+            value: record.encode_with(&root),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("control now names node 2");
+        db.route.refresh = Some((store, rt.handle().clone()));
+        let (one, old) = mpsc::channel();
+        let (two, replacement) = mpsc::channel();
+        db.links.register(OWNER, one, host::BOOT);
+        db.links.register(NodeId(2), two, host::BOOT);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let Msg::Inspect { reply, .. } = old.recv().expect("old owner look") else {
+                    panic!("expected Inspect")
+                };
+                // Its marker still stands when the link drops after dispatching the status.
+                drop(old);
+                let mut status = replan_status(false);
+                status.possible_loss = Some(host::PossibleLoss {
+                    copy: OWNER,
+                    generation: Generation(4),
+                    applied: 3,
+                    reason: host::PossibleLossReason::OsBootChanged,
+                });
+                reply.send(status).expect("status with standing marker");
+            });
+            scope.spawn(move || {
+                if let Ok(Msg::Client(Client { reply, .. })) = replacement.recv() {
+                    let _ = reply.send(Answer::PossibleLossAcked("no record".into()));
+                    panic!("ack rerouted to the unmarked replacement");
+                }
+            });
+            let answer = db.ack_possible_loss(Generation(4));
+            drop(db);
+            assert_eq!(
+                answer.expect_err("old holder unreachable").kind,
+                ErrorKind::Unavailable
+            );
+        });
+    }
+
+    #[test]
+    fn pr238_silent_inspect_after_pending_answer_keeps_the_ready_deadline() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_secs(2);
+        let node = std::thread::spawn(move || {
+            let Msg::Inspect { reply, .. } = mailbox.recv().expect("first look") else {
+                panic!("expected Inspect")
+            };
+            reply.send(replan_status(true)).expect("blocked");
+            let Msg::BootReplan { reply, .. } = mailbox.recv().expect("pending ask") else {
+                panic!("expected BootReplan")
+            };
+            reply.send((replan_status(true), true)).expect("pending");
+            let Msg::Inspect { reply: _silent, .. } = mailbox.recv().expect("next look") else {
+                panic!("expected Inspect")
+            };
+            assert!(matches!(mailbox.recv(), Ok(Msg::Stop) | Err(_)));
+        });
+        let start = Instant::now();
+        let answer = db.wait_ready(Duration::from_millis(180));
+        let elapsed = start.elapsed();
+        drop(db);
+        node.join().expect("owner");
+        assert_eq!(answer, Err(replanning_blocked()));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
     /// PR #60 review F3, merged into slice 2 (w18): a fault ends an owner this `Db` runs at once
     /// (`m10_wait_ready_answers_a_fault_of_node_1_at_once_and_names_it`), but not an owner in
     /// another process, which restarts and rejoins: it is waited on to the bound, as a blocked
@@ -14574,6 +14787,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         let (db, _unused, _rt) = unanswered(Duration::from_millis(20));
@@ -14678,6 +14892,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         // D17: "at once" is timed from the first look node 1 answered in time, not from the
@@ -14798,6 +15013,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         // From here node 1 answers, and the claim is the text an answer gives. Each look waits
@@ -15871,6 +16087,7 @@ mod tests {
                 tail_refused: None,
                 possible_loss: None,
                 needs_operator: None,
+                possible_loss_error: None,
                 members_revision: None,
             };
             let node_1 = std::thread::spawn(move || {
@@ -16931,6 +17148,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         let looks = Arc::new(AtomicU64::new(0));

@@ -1730,6 +1730,8 @@ pub struct NodeStatus {
     /// `Db::ack_possible_loss` clears it; `None` while none stands. Read from the store each
     /// time the status is built, so a restart cannot hide one. Crosses the wire.
     pub possible_loss: Option<PossibleLoss>,
+    /// Storage error when the standing record could not be read.
+    pub possible_loss_error: Option<String>,
 }
 
 /// #177: the `tracing` target of every possible-loss line (`failover_possible_loss` and the
@@ -18502,7 +18504,7 @@ impl Host {
     /// sees one that stands.
     fn warn_possible_losses(&self) {
         for partition in (1..=self.partition_count).map(PartitionId) {
-            if let Some(loss) = self.possible_loss(partition) {
+            if let Ok(Some(loss)) = self.read_possible_loss(partition) {
                 tracing::warn!(
                     target: FAILOVER_TARGET,
                     partition = partition.0,
@@ -18530,6 +18532,12 @@ impl Host {
                 })
             })
             .map_err(|fault| {
+                tracing::error!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    ?fault,
+                    "possible_loss_unreadable"
+                );
                 format!(
                     "node {}: read the possible-loss record of partition {}: {fault:?}",
                     self.node.0, partition.0
@@ -18537,30 +18545,11 @@ impl Host {
             })
     }
 
-    /// #177: the possible-loss record this node's store holds for `partition`. A read that
-    /// fails is logged `possible_loss_unreadable` at error and reported as none: the open
-    /// refused a marker it could not decode, so only the read itself can fail here.
-    fn possible_loss(&self, partition: PartitionId) -> Option<PossibleLoss> {
-        match self.engine.possible_loss(partition) {
-            Ok(mark) => mark.map(|mark| PossibleLoss {
-                copy: self.node,
-                generation: mark.generation,
-                applied: mark.applied,
-                reason: PossibleLossReason::from_cause(mark.cause),
-            }),
-            Err(fault) => {
-                tracing::error!(
-                    node = self.node.0,
-                    partition = partition.0,
-                    ?fault,
-                    "possible_loss_unreadable"
-                );
-                None
-            }
-        }
-    }
-
     fn status(&self, partition: PartitionId) -> NodeStatus {
+        let (possible_loss, possible_loss_error) = match self.read_possible_loss(partition) {
+            Ok(mark) => (mark, None),
+            Err(error) => (None, Some(error)),
+        };
         let adopted = self.adopted(partition);
         let now = self.clock.now();
         // Admitting takes both halves: L1 admitting and A1 admitting. L1 alone said
@@ -18671,7 +18660,8 @@ impl Host {
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
             tail_refused: self.tail_refused_of(partition),
-            possible_loss: self.possible_loss(partition),
+            possible_loss,
+            possible_loss_error,
             needs_operator: self.needs_operator(partition),
             members_revision: self
                 .links

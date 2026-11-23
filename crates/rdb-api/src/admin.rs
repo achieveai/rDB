@@ -7738,6 +7738,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         }
     }
@@ -8237,6 +8238,7 @@ mod tests {
             tail_refused: None,
             possible_loss: None,
             needs_operator: None,
+            possible_loss_error: None,
             members_revision: None,
         };
         for (qualifying_copy, clock_bound_lost) in
