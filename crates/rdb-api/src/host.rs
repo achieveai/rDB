@@ -13183,6 +13183,28 @@ impl Host {
     ) -> Result<(), Fault> {
         let partition = site.partition;
         let landed_generation = result.new_generation;
+        if let Some(member) = result
+            .committed
+            .pinned_config
+            .members
+            .iter()
+            .find(|member| {
+                member.node == self.node
+                    && member.boot != crate::admin::UNLINKED_BOOT
+                    && member.boot < self.boot
+            })
+        {
+            tracing::info!(
+                node = self.node.0,
+                boot = self.boot.0,
+                pinned_boot = member.boot.0,
+                partition = partition.0,
+                generation = landed_generation.0,
+                emitter = emitter.0,
+                "recovered_refused_stale_boot"
+            );
+            return Ok(());
+        }
         let first = self.landed.insert((partition, result.new_generation));
         let barrier = in_barrier(&result, self.node);
         tracing::info!(
