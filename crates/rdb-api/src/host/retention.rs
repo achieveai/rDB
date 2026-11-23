@@ -2,8 +2,7 @@
 //! [`RETENTION_DUTY_MILLIS`], each partition this node holds gets one round: the host gathers
 //! what [`retention_floor`] reads from its engine and kernel, and when the floor moves it trims
 //! there through `Host::trim_history_through` (R1's ladders, then the engine, then the kept
-//! ladders). The simulator's twin is `rdb_sim`'s `Dispatcher::retention_duty`; both call the
-//! same pure function.
+//! ladders). The simulator's twin returns under #239.
 //!
 //! * `prev`, `applied` and `own_durable` are the engine's, of the partition's newest lineage.
 //!   `keep` comes from this node's [`RetentionSamples`], the cap from
@@ -72,7 +71,7 @@ pub(crate) struct RetentionState {
     /// owner ruling 2026-11-20, option 1): one more each time the cap ends one
     /// `budget_overran`, reset by any round for the copy that is not an overrun: a `caught_up`
     /// release, or a round whose floor stays at or below its open transfer's pin. A held round
-    /// decides no floor, so it neither counts nor resets. The simulator's `overruns` is its twin.
+    /// decides no floor, so it neither counts nor resets. The simulator's twin returns under #239.
     pub(crate) overruns: BTreeMap<CopyId, u32>,
     /// Per copy this node stopped offering at [`OverrunAction::GiveUp`]: the budget and the
     /// generation in force then, and the overruns counted. Named in `NodeStatus::needs_operator`
@@ -281,7 +280,7 @@ impl Host {
     }
 
     /// The no-trim gate the duty finds on `partition`, the first that holds, or `None` (design
-    /// 3.1, "No trim while"; the simulator's `retention_hold` is its twin).
+    /// 3.1, "No trim while"; the simulator's twin returns under #239).
     ///
     /// * `Staging` / `Installing`: the newest lineage is mid copy or mid install, or this node
     ///   holds an install of the partition open.
@@ -356,11 +355,13 @@ impl Host {
     }
 
     /// Clear every give-up of `partition` the round at `generation` no longer stands by (lead
-    /// ruling R27): `history_budget_bytes` is now higher than at the give-up (`budget_raised`,
-    /// the operator's remedy, which works without a restart), or the generation is newer
-    /// (`new_generation`, a new plan). The count goes with it, logged
+    /// ruling R27): `history_budget_bytes` is now higher than at the give-up (`budget_raised`),
+    /// or the generation is newer (`new_generation`, a new plan). The count goes with it, logged
     /// [`HISTORY_BUDGET_GIVE_UP_CLEARED`], so the copy's next ask is offered again. A lower or
-    /// equal budget clears nothing. The simulator's `clear_give_ups` is its twin.
+    /// equal budget clears nothing. The budget is fixed when the node starts, so in a running
+    /// node `budget_raised` is reached only by a row that sets it; the operator's remedy is a
+    /// reopen with a larger budget, which starts with no give-up. The simulator's twin returns
+    /// under #239.
     fn clear_give_ups(&mut self, partition: PartitionId, generation: Generation) {
         let budget_bytes = self.history_retention.budget_bytes;
         let node = self.node.0;

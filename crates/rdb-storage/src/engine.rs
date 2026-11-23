@@ -1555,6 +1555,8 @@ impl RocksEngine {
     /// # Errors
     ///
     /// [`StorageFault::WriteFailed`] when RocksDB refuses the write; nothing is applied.
+    /// [`StorageFault::Corrupt`] when a delete on a linked lineage cannot read a lower level's
+    /// record (S5a's point read fails, or its frame does not decode); nothing is applied.
     pub fn commit(&mut self, batch: Batch) -> Result<AppliedSeq, StorageFault> {
         let key = (batch.partition, batch.generation);
         let marks = self.lineages.get(&key).copied().unwrap_or_default();
@@ -2135,10 +2137,11 @@ impl RocksEngine {
     }
 
     /// An **estimate** of the bytes of `History` lineage `(partition, generation)` keeps from
-    /// `from` through its applied head (issue #61 S3, lead ruling R25), the twin of
-    /// `MemoryEngine::history_bytes`: the retained seqs in `[max(from, floor, 1), head]` times
-    /// the partition's mean record size. Reads nothing from RocksDB; the cost is the
-    /// [`Self::floor`] walk, O(lineage levels).
+    /// `from` through its applied head (issue #61 S3, lead ruling R25): the retained seqs in
+    /// `[max(from, floor, 1), head]` times the partition's mean record size (the simulator's
+    /// twin returns under #239). The cost is the [`Self::floor`] walk, O(lineage levels), and,
+    /// on the cold path while the partition has no learnt mean, two RocksDB property reads
+    /// ([`Self::history_record_bytes`]); no record is read.
     ///
     /// The count follows the same chain [`Self::get`] and [`Self::stage_trim_history`] walk: the
     /// lineage's own level holds `(base, head]` and each parent the seqs at or below the base it
@@ -2156,7 +2159,7 @@ impl RocksEngine {
     /// months a shift in record size moves it slowly, and the estimate lags the new size for as
     /// long as the old records dominate the sample.
     ///
-    /// Unlike the memory twin, no `Progress` bytes count: RocksDB keeps only the head's. The
+    /// No `Progress` bytes count: RocksDB keeps only the head's. The
     /// retention cap (`rdb_core::replication::retention::cap_seq`) needs only that the answer
     /// never grows as `from` or the floor rises, which holds for any fixed mean. 0 when `from`
     /// is above the head, or the lineage is unknown.

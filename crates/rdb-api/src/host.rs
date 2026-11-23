@@ -1608,6 +1608,8 @@ pub struct NodeStatus {
     /// past the history floor that only `admin forget-tail` can give up. On that copy, from its
     /// own `tail_held` refusal of an offer; on the owner, from a refusal it heard and no
     /// forget-tail has released yet. Names the copy, its node, `H` and the full command.
+    /// It can instead carry budget advice: on a source that gave a copy up after the history
+    /// budget overran its transfers ([`rdb_core::replication::retention::needs_history_budget`]).
     /// `None` while nothing needs one. Crosses the wire.
     pub needs_operator: Option<String>,
 }

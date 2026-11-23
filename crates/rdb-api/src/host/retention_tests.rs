@@ -935,7 +935,7 @@ fn t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises() 
 /// by the first round in a newer one, logged `history_budget_give_up_cleared{why =
 /// new_generation}`, with its count. The give-up is planted at generation 0 on a host holding
 /// generation 1; making one for real and then re-planning takes a failover (the simulator's
-/// `t61_sim_s3_r4b_a_new_generation_clears_the_give_up` does). A give-up at the same generation
+/// row for it returns under #239). A give-up at the same generation
 /// and budget stands.
 ///
 /// Cut: no `new_generation` clear, red (the give-up stands). Unit.

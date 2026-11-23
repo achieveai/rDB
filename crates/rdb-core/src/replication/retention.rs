@@ -1,5 +1,5 @@
 //! Issue #61 S3 (design §3.1): the History retention floor `F`, computed by one pure function
-//! that the host's trim duty and the simulator's twin both call.
+//! that the host's trim duty calls (the simulator's twin returns under #239).
 //!
 //! ```text
 //! need = min( own_durable,
@@ -74,15 +74,16 @@ pub const fn overrun_action(consecutive: u32) -> OverrunAction {
 
 /// `needs_operator`'s text for a copy whose transfers the budget overran
 /// [`HISTORY_BUDGET_OVERRUN_ATTEMPTS`] times in a row: the copy, the source node, and the
-/// remedy. The give-up clears itself when the budget in force rises above the one it was
-/// recorded at, or the partition moves to a new generation (lead ruling R27), so the text says
-/// the copy is retried then.
+/// remedy. The budget is fixed when the node starts, so the remedy is a reopen with a larger
+/// one, which starts with no give-up; reducing writes alone clears nothing. In a running node
+/// the give-up clears when the partition moves to a new generation or the copy catches up
+/// (lead ruling R27), and the copy is retried then.
 #[must_use]
 pub fn needs_history_budget(copy: CopyId, node: NodeId, attempts: u32) -> String {
     format!(
         "copy {} cannot be rebuilt from node {}: the history budget overran its snapshot \
-         transfer {attempts} times in a row; raise history budget or reduce writes, then the \
-         copy is retried automatically",
+         transfer {attempts} times in a row; reopen with a larger history budget (reducing \
+         writes alone does not clear this)",
         copy.0, node.0
     )
 }

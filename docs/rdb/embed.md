@@ -1935,9 +1935,10 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   snapshot transfer before it finishes. The source restarts it, and after 3 in a row it stops
   and sets `needs_operator` in `Db::node_status()` on that node: "copy N cannot be rebuilt from
   node M: the history budget overran its snapshot transfer 3 times in a row; ...". It is
-  logged `history_budget_gave_up` (warn). Raise `history_budget_bytes`, or reduce writes. A
-  raised budget, a new generation or the copy catching up clears it
-  (`history_budget_give_up_cleared`), and the copy is retried with no restart.
+  logged `history_budget_gave_up` (warn). To change the history budget, reopen the `Db` with a
+  larger `history_budget_bytes`: the budget is fixed when the node starts. Reducing writes alone
+  does not clear an existing give-up. A new generation or the copy catching up clears it with no
+  restart (`history_budget_give_up_cleared`), and the copy is retried.
 - **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
   `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
   set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,
