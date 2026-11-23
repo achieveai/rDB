@@ -1447,6 +1447,67 @@ mod tests {
         verify_lineage(&engine, PartitionId(1), Generation(2)).expect("g2 verifies");
     }
 
+    /// S5a-R2: a copied child's delete of a key its parent holds leaves no physical row. g1
+    /// holds `k` at 10 and puts `j` at 11, so g2's switch at base 10 is a full copy and its link
+    /// is `copied`: User reads stop at g2. g2 then deletes `k` at 11. Since no read falls
+    /// through to g1's `k`, the delete is plain: g2 stores no User row at all and `k` reads
+    /// absent, while g1 keeps `k`. The dump, taken with the engine closed, holds after a reopen too.
+    /// Cut: `lower_holds` ignores `copied` (`_ => true`), red (a `k` tombstone row is left).
+    /// Unit (~50 ms): one engine, 13 commits and a copy.
+    #[test]
+    fn s5a_r2_a_copied_child_delete_leaves_no_physical_user_row() {
+        let db = data_dir("s5a-r2").join("db");
+        {
+            let mut engine = RocksEngine::open(&db).expect("open");
+            let at_10 = write_g1(&mut engine);
+            let late = delete::request_batch(
+                lineage(1),
+                Seq(11),
+                at_10,
+                Vec::new(),
+                rdb_core::contracts::txn::Mutation::Put {
+                    key: scoped_key(TenantId(1), AffinityId(1), b"j"),
+                    value: bytes::Bytes::from_static(b"late"),
+                    expected_version: None,
+                },
+            )
+            .expect("put j");
+            engine.commit(late).expect("commit the late put");
+            let inherited = engine.inherit(PartitionId(1), Generation(1), Generation(2), Seq(10));
+            assert!(
+                matches!(inherited, Ok(Inherited::Copied { .. })),
+                "{inherited:?}"
+            );
+            assert_eq!(
+                read_k(&engine, 2),
+                Some((Generation(2), 10)),
+                "k was not copied"
+            );
+            let delete = delete_batch(lineage(2), Seq(11), at_10).expect("delete k");
+            engine.commit(delete).expect("commit the delete");
+            assert_eq!(read_k(&engine, 2), None, "k reads back in g2");
+        }
+        assert_eq!(
+            dumped_data(&db, 2),
+            Vec::<String>::new(),
+            "g2 keeps a User row"
+        );
+        let engine = RocksEngine::open(&db).expect("reopen");
+        assert_eq!(
+            read_k(&engine, 2),
+            None,
+            "k reads back in g2 after a reopen"
+        );
+        assert_eq!(read_k(&engine, 1), Some((Generation(1), 10)), "g1 lost k");
+        verify_lineage(&engine, PartitionId(1), Generation(2)).expect("g2 verifies");
+        drop(engine);
+        assert_eq!(
+            dumped_data(&db, 2),
+            Vec::<String>::new(),
+            "g2 keeps a User row after a reopen"
+        );
+    }
+
     /// #11: a late delete before the switch is undone in the copy: k is restored at its value as
     /// of base, while the parent keeps the delete.
     #[test]
