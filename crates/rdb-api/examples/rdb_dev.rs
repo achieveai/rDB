@@ -9904,6 +9904,10 @@ mod tests {
             "[--abort-after-commit] [--pause-before-sync N=MS]",
             "put <object> <value> [--if-version N]",
             "The JSONL log goes to `<log-dir>/rdb_dev.jsonl`",
+            // PR #244 review: the #80 S4 admin verbs, and where their usage is.
+            "`admin add-node`, `admin remove-node`, `admin rebalance`,",
+            "`admin drain` and `admin placement`",
+            "A bare `admin` line in a session prints every admin",
         ] {
             assert!(text.contains(says), "{says}");
         }
@@ -10413,6 +10417,17 @@ mod tests {
             .find("for an in-process Db, run admin drain <n> first")
             .expect(REMOVE_NODE_USAGE);
         assert!(rdb_node < drain, "{REMOVE_NODE_USAGE}");
+        // PR #244 review: and the prerequisites both paths share.
+        for says in [
+            "n must own no partition",
+            "no partitions/ record may pin a copy on it",
+            "after a stop, wait until its copies are dropped",
+        ] {
+            assert!(
+                REMOVE_NODE_USAGE.contains(says),
+                "{says}: {REMOVE_NODE_USAGE}"
+            );
+        }
         assert_eq!(parse_rebalance(&words("")), Ok(None));
         assert_eq!(parse_rebalance(&words("--max-moves 0")), Ok(Some(0)));
         assert_eq!(parse_rebalance(&words("--max-moves 12")), Ok(Some(12)));

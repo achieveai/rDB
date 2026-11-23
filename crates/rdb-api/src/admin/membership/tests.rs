@@ -420,8 +420,9 @@ fn s80s4_remove_node_writes_layout_3_once_and_refuses_a_pinned_node_and_too_few_
 /// M6 removed-peer half (#80 S4, S-4): five nodes are declared and `nodes/2` is then written
 /// removed (layout 3). Node 3's start check with `--peers` still naming 2 passes, skipping 2
 /// with a warn (`start_peer_removed_skipped`, naming peer 2); one that leaves removed 2 out
-/// passes with no warn, as T13's start after a remove does. While 2 was live, leaving it out was
-/// refused, as before: a live lower id is still required. A peer that is neither live nor
+/// passes with no warn, as an embedded `Db::open` may (its `DbConfig::addresses`; rdb_node's
+/// `peer_set` refuses a gap first, so its `--peers` keep removed ids). While 2 was live,
+/// leaving it out was refused, as before: a live lower id is still required. A peer that is neither live nor
 /// removed (node 7) is still refused. Unit (one store).
 /// Cuts: (A) `node_start_refusal` without the skip: "peer address 2=127.0.0.2:7100 names node
 /// 2, which has no nodes/2", red at (a); (B) its `declared()` keeps removed ids: "no peer address
@@ -479,7 +480,7 @@ fn s80s4_start_check_skips_a_removed_peer_and_still_refuses_an_unknown_one() {
     assert_eq!(skipped.len(), 1, "{skipped:?}");
     assert_eq!(skipped[0]["peer"], 2, "{skipped:?}");
 
-    // (b) removed 2 left out, as T13 writes --peers after a remove: no warn.
+    // (b) removed 2 left out, as an embedded open's addresses may: no warn.
     assert_eq!(start(&peers(&[1, 4, 5])), None, "removed 2 is not required");
     assert_eq!(skips().len(), 1, "no second warn");
 
