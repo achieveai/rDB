@@ -7590,7 +7590,7 @@ impl Host {
             }
             let (copy, durable, clock) = match self.holding_up(partition, now) {
                 Some((copy, durable)) => (copy, durable, DropClock::Paused),
-                None => match self.lagging_past_pause(partition) {
+                None => match self.lagging_past_pause(partition, now) {
                     Some((copy, durable)) => (copy, durable, DropClock::Lagging),
                     None => {
                         self.blamed.remove(&partition);
@@ -9571,12 +9571,22 @@ impl Host {
     /// same drop clock, the most-behind regular secondary that warned `copy_durable_lagging`
     /// ([`Self::warn_lagging`]): the blame starts at the Warn, at `pause_age_millis`, where the
     /// paused clock used to start. The gates are [`Self::holding_up`]'s.
-    fn lagging_past_pause(&self, partition: PartitionId) -> Option<(CopyId, DurableSeq)> {
+    fn lagging_past_pause(
+        &self,
+        partition: PartitionId,
+        now: Tick,
+    ) -> Option<(CopyId, DurableSeq)> {
         if self.rejoins.contains_key(&partition) {
             return None;
         }
         let committed = self.committed.get(&partition)?;
         if committed.mode == PartitionMode::ReadOnly || !self.is_pinned_primary(partition) {
+            return None;
+        }
+        // L1 blocking for an operator (a divergence, spec §8.1) is no drop clock's to clear,
+        // as in `holding_up`; only a pause on lag hands over to it there.
+        let state = self.l1.get(&partition)?.protection.admission_state(now)?;
+        if !state.allow && state.reason != Some(ErrorKind::ProtectionPaused) {
             return None;
         }
         let tracker = self.replication.primary(self.node, partition)?.tracker();
