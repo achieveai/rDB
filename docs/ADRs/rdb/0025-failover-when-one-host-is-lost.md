@@ -511,7 +511,35 @@ In `crates/rdb-api/src/host/drop_tests.rs`, writes during a refill:
   3884 puts landed, the longest gap 6.86 s". Not investigated: the cut's re-plan loop with
   phase "other".
 
-<!-- TODO (S4): the Docker add d6 / remove d2 run (D2). -->
+### Docker run D2: add d6, remove d2, lose and remove d4
+
+**What it proves.** The S4 path on separate containers, each with its own IP. The rig is the
+D1 rig: five data nodes and three rEtcd voters, mutual TLS on the control link. The run adds
+node 6, removes node 2, then kills and removes node 4, with a `rebalance` after each loss.
+Every data node runs `rdb_node --failover` under `up --restart-on-exit`. `check-members`
+judges the result as A1-A11 (the claim list is in the script's header). It does not test
+separate machines. Removal follows ruling B: stop the node, then `admin remove-node N
+--unreachable-ok N`, with no drain (#226).
+
+**Run 3b, 2026-11-22, image `rdb-bf-node:s34b-75dd268`: passed.**
+
+| Step | Result |
+|---|---|
+| up, check, add 6, rebalance | exit 0 |
+| remove 2 | exit 0: `docker stop`, then `remove-node --unreachable-ok`, one retry while node 2 was still pinned |
+| rebalance | 8 refills |
+| kill 4, remove 4 | exit 0, one retry |
+| rebalance | 10 refills, `copy_skew=0`, `primary_skew=5` |
+| check-members | 24 passed, 0 failed, 0 not exercised |
+
+- A1-A11 all passed. A10 was exercised: node 6 became owner of partitions 3 and 13.
+- Teardown left 0 containers, 0 networks and 0 volumes.
+- `primary_skew=5` is expected: primaries even out only after the deferred live handoff
+  (#243).
+- **Runs 1 and 2 failed, and that led to ruling B.** A drained `rdb_node` meets the V10
+  restart rule and exits 75, so drain then remove does not work for `rdb_node` (#226).
+- **Run 3 failed** on a test-design error: it had no `rebalance` between the two losses, so
+  node 4 stayed pinned. The script's header now states that rule.
 
 ## References
 
