@@ -513,8 +513,10 @@ can call it, an app-only `Db` on a peer too (`lr promote 3 --partition 2`, rdb_d
   - The ack clears it only for its own generation: another number is `INVALID_ARGUMENT` and
     clears nothing, so a stale ack cannot clear a newer record. Before reporting that no record
     stands, the ack checks the formation nodes and the durable `nodes/` registry, including
-    removal tombstones. An unreachable former member leaves the result unknown and no ack is
-    sent. If all checked nodes report no record, success reflects the registry snapshot and
+    removal tombstones. Any registered node whose marker cannot be read leaves absence
+    unknown (`UNAVAILABLE`). A malformed `nodes/` key yields `INCOMPATIBLE_VERSION`. Both
+    errors leave the ack unsent. A retired holder that remains unreachable has no supported
+    operation to certify its marker absent. The empty scan must finish before its deadline. If all checked nodes report no record, success reflects the registry snapshot and
     each node’s marker when read. A concurrent promotion can create a newer marker.
     A missing reply after dispatch leaves the clear outcome unknown. Read node status
     or retry the same generation. Discovery assumes the registry has been maintained by rDB;

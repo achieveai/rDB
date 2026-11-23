@@ -8094,7 +8094,10 @@ impl Db {
     /// owner, naming it: the ack is run from that node's process (a holder-targeted ack is
     /// #245); `INVALID_ARGUMENT`, nothing changed, when this `Db` runs over links as an app the
     /// node does not list as an admin app; `UNAVAILABLE`, nothing cleared, when a node that may
-    /// hold a record cannot be checked or discovery times out. A lost answer after dispatch
+    /// hold a record cannot be checked, including any unreadable registered node, or the
+    /// empty check finishes at or after its deadline. A malformed `nodes/` key yields
+    /// `INCOMPATIBLE_VERSION`. There is no supported override to certify absence on an
+    /// unreachable retired node. A lost answer after dispatch
     /// leaves the clear outcome unknown: read status or retry the same generation. A local
     /// storage read failure is a host error. If all possible holders report absence, the
     /// owner's idempotent ack is `Ok`. Absence reflects the registry snapshot and the
@@ -8295,6 +8298,12 @@ impl Db {
                     holders.push(loss);
                     break;
                 }
+            }
+            if holders.is_empty() && Instant::now() >= deadline {
+                let mut error = ApiError::new(ErrorKind::Unavailable,
+                    "possible-loss discovery reached its deadline: whether a marker stands is unknown; no ack was sent");
+                error.no_mutation = true;
+                return Err(error);
             }
         }
         Ok((owner, holders))
@@ -14854,6 +14863,101 @@ mod tests {
                 "only the proven empty ack was dispatched"
             );
         });
+    }
+
+    #[test]
+    fn pr238_incomplete_former_holder_scan_and_bad_registry_key_never_dispatch_an_ack() {
+        let (mut db, _, _rt) = unanswered(Duration::from_millis(20));
+        lock(&db.nodes).clear();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        db.opened.control = Some(PromoteStore(
+            Arc::clone(&store),
+            rt.handle().clone(),
+            Budgets::SPEC_DEFAULTS,
+        ));
+        db.opened.nodes = vec![OWNER, NodeId(7), NodeId(8)].into();
+        let (one, owner) = mpsc::channel();
+        db.links.register(OWNER, one, host::BOOT);
+        let (seven, first) = mpsc::channel();
+        db.links.register(NodeId(7), seven, host::BOOT);
+        let (eight, second) = mpsc::channel();
+        db.links.register(NodeId(8), eight, host::BOOT);
+        std::thread::scope(|scope| {
+            let owner = scope.spawn(move || {
+                let mut acks = 0;
+                while let Ok(msg) = owner.recv() {
+                    match msg {
+                        Msg::Inspect { reply, .. } => {
+                            let _ = reply.send(replan_status(false));
+                        }
+                        Msg::Client(Client { reply, .. }) => {
+                            acks += 1;
+                            let _ = reply.send(Answer::PossibleLossAcked("no record".into()));
+                        }
+                        _ => {}
+                    }
+                }
+                acks
+            });
+            let first_node = scope.spawn(move || {
+                let mut looks = 0;
+                while let Ok(Msg::Inspect { reply, .. }) = first.recv() {
+                    looks += 1;
+                    let mut status = replan_status(false);
+                    status.node = NodeId(7);
+                    let _ = reply.send(status);
+                }
+                looks
+            });
+            let second_node = scope.spawn(move || {
+                let mut looks = 0;
+                while let Ok(Msg::Inspect { reply, .. }) = second.recv() {
+                    looks += 1;
+                    let mut status = replan_status(false);
+                    status.node = NodeId(8);
+                    status.possible_loss_error = Some("marker read failed".into());
+                    let _ = reply.send(status);
+                }
+                looks
+            });
+            let failed_read = db.ack_possible_loss(Generation(4));
+            rt.block_on(store.put(config_core::PutRequest {
+                key: Bytes::from_static(b"nodes/bad"),
+                value: Bytes::from_static(b"bad"),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("invalid registry key");
+            let malformed = db.ack_possible_loss(Generation(4));
+            drop(db);
+            assert!(
+                matches!(failed_read, Err(ref e) if e.kind == ErrorKind::Unavailable && e.detail.contains("node 8") && e.detail.contains("marker read failed")),
+                "{failed_read:?}"
+            );
+            assert!(
+                matches!(malformed, Err(ref e) if e.kind == ErrorKind::IncompatibleVersion && e.no_mutation && e.detail.contains("nodes/bad")),
+                "{malformed:?}"
+            );
+            assert_eq!(first_node.join().expect("first holder"), 1);
+            assert_eq!(second_node.join().expect("second holder"), 1);
+            assert_eq!(owner.join().expect("owner"), 0);
+        });
+    }
+
+    #[test]
+    fn pr238_an_expired_replan_ask_and_following_inspect_do_not_wait_for_a_reply() {
+        let (mut db, _mailbox, _rt) = unanswered(Duration::from_millis(20));
+        db.timeouts.read = Duration::from_secs(3);
+        for deadline in [Instant::now() - Duration::from_secs(1), Instant::now()] {
+            let started = Instant::now();
+            assert!(db.boot_replan_look(PARTITION, OWNER, deadline).is_none());
+            assert!(matches!(
+                db.look_by(PARTITION, OWNER, db.timeouts.read, Some(deadline)),
+                Err(Unlooked::NoAnswer)
+            ));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
     }
 
     #[test]

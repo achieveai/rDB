@@ -477,8 +477,11 @@
 //!                                         `ack-possible-loss: partition 1 generation G
 //!                                         cleared`. Refused, nothing cleared, when the
 //!                                         record names another generation; none standing
-//!                                         is not an error. Under `--nodes`, only an admin
-//!                                         app may run it
+//!                                         is not an error once all nodes have been checked.
+//!                                         An unreadable registered node leaves absence unknown
+//!                                         (UNAVAILABLE); a malformed nodes/ key gives
+//!                                         INCOMPATIBLE_VERSION. No ack is sent in either case.
+//!                                         Under `--nodes`, only an admin app may run it
 //! admin trim-history --through N [--node n]
 //!                                         debug builds only (issue #61): delete partition 1's
 //!                                         History below seq N on node n, or on every node this
