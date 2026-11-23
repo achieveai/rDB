@@ -1083,14 +1083,10 @@ fn m10_s2_b13_a_plan_blocked_by_a_control_outage_is_sent_again() {
     let (mut trio, before) = started(dir.path(), tuned);
 
     kill(&trio, 3, &[1, 2]);
-    let (request, _) = put_until_drop_planned(&mut trio, 1);
-    trio.until("node 1 planned the drop", |trio| {
-        matches!(
-            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
-            Some(Rejoin::Planned { .. })
-        )
-        .then_some(())
-    });
+    // #79: the drop's plan can commit inside the put that plans it, so the store goes down
+    // once the drop clock has started, before the plan, not after it. No put follows: a put
+    // would meet the block, and the drop duty runs on the hosts' timers anyway.
+    let (request, _) = put_until_blamed(&mut trio, 1);
     trio.mem
         .failing_with(config_core::ConfigError::Unavailable {
             reason: "the control store is down".to_owned(),
