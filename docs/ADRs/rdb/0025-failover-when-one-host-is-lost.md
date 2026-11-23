@@ -511,7 +511,7 @@ In `crates/rdb-api/src/host/drop_tests.rs`, writes during a refill:
   3884 puts landed, the longest gap 6.86 s". Not investigated: the cut's re-plan loop with
   phase "other".
 
-### Docker run D2: add d6, remove d2, lose and remove d4
+### Docker run D2, `scripts/docker-multihost.sh` add, remove, rebalance and check-members (#80 S4)
 
 **What it proves.** The S4 path on separate containers, each with its own IP. The rig is the
 D1 rig: five data nodes and three rEtcd voters, mutual TLS on the control link. The run adds
@@ -521,16 +521,17 @@ judges the result as A1-A11 (the claim list is in the script's header). It does 
 separate machines. Removal follows ruling B: stop the node, then `admin remove-node N
 --unreachable-ok N`, with no drain (#226).
 
-**Run 3b, 2026-11-22, image `rdb-bf-node:s34b-75dd268`: passed.**
+**Run 3b, 2026-11-22, image `rdb-bf-node:s34b-75dd268`: passed.** Each step's output is kept
+in the working notes outside the repository, under `s4a/d2/run3b/` (one `.out` file per step).
 
 | Step | Result |
 |---|---|
-| up, check, add 6, rebalance | exit 0 |
+| up, check, add 6, rebalance | exit 0; the rebalance made 8 moves |
 | remove 2 | exit 0: `docker stop`, then `remove-node --unreachable-ok`, one retry while node 2 was still pinned |
 | rebalance | 8 refills |
 | kill 4, remove 4 | exit 0, one retry |
 | rebalance | 10 refills, `copy_skew=0`, `primary_skew=5` |
-| check-members | 24 passed, 0 failed, 0 not exercised |
+| check-members | `check-members: all passed, 0 not exercised` (24 `PASS` lines) |
 
 - A1-A11 all passed. A10 was exercised: node 6 became owner of partitions 3 and 13.
 - Teardown left 0 containers, 0 networks and 0 volumes.
