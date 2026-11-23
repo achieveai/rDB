@@ -292,7 +292,13 @@ fn leaf(
 /// Refused, writing nothing, when `ca.pem` or `ca.key` is missing (a fresh CA would sign a
 /// certificate no formed node trusts), or when `node-<n>.pem` or `node-<n>.key` already exists
 /// (a node's key is never replaced under it). Otherwise the step that failed, with the path.
+/// An existing `dir` is made owner-only ([`private_dir`]) first, before either check, so no
+/// other user can plant a file in it while the key is written (PR #244 review); a missing one
+/// is not created.
 pub fn issue_node(dir: &Path, node: NodeId) -> Result<(), String> {
+    if dir.is_dir() {
+        private_dir(dir)?;
+    }
     let rcgen = |error: rcgen::Error| error.to_string();
     let label = Label::Node(node);
     let read = |name: &str| {
@@ -769,6 +775,48 @@ mod tests {
             read(keyless.join("ca.pem")) == ca_pem,
             "the CA is unchanged"
         );
+    }
+
+    /// PR #244 review (certs.rs): `issue_node` makes an existing folder `0700` before its CA and
+    /// output checks, even when a check then refuses: a `0777` folder holding node 2 is `0700`
+    /// after issuing 2 is refused, and node 2's files are unchanged; a `0777` folder without
+    /// `ca.key` is `0700` after that refusal. Unit, Unix.
+    /// Cut: no `private_dir` in `issue_node`; the folder stays `0777`, red.
+    #[cfg(unix)]
+    #[config_log::retcd_test]
+    fn pr244_issue_node_makes_an_existing_folder_private_before_its_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |dir: &Path| {
+            std::fs::metadata(dir)
+                .expect("the folder")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let open = |dir: &Path| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+            assert_eq!(mode(dir), 0o777);
+        };
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("certs");
+        generate(&dir, &[Label::Node(NodeId(1)), Label::Node(NodeId(2))]).expect("certs");
+        let files = |dir: &Path| {
+            ["node-2.pem", "node-2.key"]
+                .map(|name| std::fs::read(dir.join(name)).expect("node 2's file"))
+        };
+        let before = files(&dir);
+        open(&dir);
+        let refused = issue_node(&dir, NodeId(2)).expect_err("node 2 has a certificate");
+        assert!(refused.contains("node-2.pem exists"), "{refused}");
+        assert_eq!(mode(&dir), 0o700, "made private before the output check");
+        assert!(files(&dir) == before, "node 2's files are not replaced");
+
+        let keyless = root.path().join("keyless");
+        generate(&keyless, &[Label::Node(NodeId(1))]).expect("certs");
+        std::fs::remove_file(keyless.join("ca.key")).expect("remove ca.key");
+        open(&keyless);
+        issue_node(&keyless, NodeId(6)).expect_err("no ca.key");
+        assert_eq!(mode(&keyless), 0o700, "made private before the CA check");
     }
 
     /// #80 S2 review r1: `generate` and `generate_control` leave the generation folder and

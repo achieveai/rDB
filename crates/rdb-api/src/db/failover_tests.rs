@@ -1941,6 +1941,7 @@ fn interrupted_sweep(method: &str, at: HoldAt) {
             frozen.is_some_and(|(grant, _)| grant.frozen),
             "the freeze applied: {frozen:?}"
         ),
+        HoldAt::AppliedUnknown => unreachable!("this row parks the freeze"),
     }
 
     let cut = PrefixCut::new(

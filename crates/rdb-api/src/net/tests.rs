@@ -1921,6 +1921,46 @@ async fn r4_t30_a_list_from_an_app_not_on_the_admin_list_is_refused_and_lists_no
     .await;
 }
 
+/// #80 S4 (PR #244 review, net/mod.rs): as the move row, for `admin refill`: an app not on the
+/// admin list is refused `INVALID_ARGUMENT`, no_mutation, and node 1's node never sees the call.
+/// Cut: no `WireCall::Refill` arm in `sender_refused`, red: node 1's first message is the refill.
+/// Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr244_a_refill_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing() {
+    let (got, answer) = app_admin_call(
+        "pilot",
+        ClientCall::Refill {
+            identity: identity(9, 1),
+            to: NodeId(4),
+        },
+    )
+    .await;
+    assert_not_admin(
+        "pr244_a_refill_from_an_app_not_on_the_admin_list_is_refused_and_does_nothing",
+        &got,
+        &answer,
+        "pilot",
+        "refill",
+    );
+}
+
+/// #80 S4 (PR #244 review): the admin app's `admin refill` reaches node 1's node whole, and
+/// takes request 1, the control for the row above. Integration (~150 ms).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr244_the_admin_app_reaches_the_owner_with_a_refill() {
+    let call = ClientCall::Refill {
+        identity: identity(9, 1),
+        to: NodeId(4),
+    };
+    let (got, _answer) = app_admin_call("admin", call.clone()).await;
+    let Msg::Client(Client { call: reached, .. }) = got else {
+        panic!("the admin app's refill reaches node 1's node: {got:?}");
+    };
+    assert_eq!(format!("{reached:?}"), format!("{call:?}"));
+    let taken = client_requests("pr244_the_admin_app_reaches_the_owner_with_a_refill");
+    assert!(taken.contains(&(1, "refill".to_owned())), "{taken:?}");
+}
+
 /// A-R479: the admin app (`admin`, as `lr` and `rdb_dev` run) still reaches node 1's node with
 /// a move and a rebuild, so `lr move` and `lr rebuild` keep working. That the move then
 /// completes is the multi-process rows' and the `lr move` hand check's (T12's row runs its

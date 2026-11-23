@@ -4513,6 +4513,10 @@ impl Db {
         max: u32,
         source: Source,
     ) -> Result<FeedPage, ApiError> {
+        // #80 S4 (PR #244 review): a removed node's Db sends no feed request.
+        if let Some(error) = self.removed_refusal() {
+            return Err(error);
+        }
         if partition.0 == 0 || partition.0 > self.route.partitions() {
             return Err(ApiError::invalid(format!(
                 "partition {} is not one of this database's {}",
@@ -6784,6 +6788,13 @@ impl Db {
         nodes: &[NodeId],
         within: Duration,
     ) -> BTreeMap<NodeId, Result<NodeStatus, String>> {
+        // #80 S4 (PR #244 review): a removed node's Db sends no status request.
+        if let Some(error) = self.removed_refusal() {
+            return nodes
+                .iter()
+                .map(|node| (*node, Err(error.detail.clone())))
+                .collect();
+        }
         nodes
             .iter()
             .map(|node| {

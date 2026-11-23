@@ -6,7 +6,7 @@
 //! watcher (`admin::watch_members`) admits node 6 on its links (`Net::set_members`).
 
 use super::failover_tests::until;
-use super::formation_tests::group_of;
+use super::formation_tests::{group_of, snapshot};
 use super::reopen_tests::{config, fast, runtime};
 use super::*;
 use crate::net::faults::Faults;
@@ -729,9 +729,13 @@ fn node_revision(rig: &Rig, node: NodeId) -> u64 {
 /// start, so it is named in `unreachable_ok`). `membership_settled` then refuses, naming live
 /// member 3 and its older revision; once node 3's cut is lifted it settles, every other member
 /// having applied `nodes/6`. Integration (five node processes).
+/// PR #244 review (membership.rs): the checked `admin::add_member` of a node 7 is refused the
+/// same way while node 3 is held, and the whole store is unchanged; once settled it adds node 7.
 ///
 /// Cut: `membership_settled` takes any reported revision as current, so it settles while node
 /// 3 is held ("node 3's held watcher blocks"), red, observed 2026-11-21.
+/// Cut (PR #244): `add_member` skips `membership_settled`: node 7 is written while node 3 is
+/// held, red.
 #[config_log::retcd_test]
 fn s80s4_membership_changes_refuse_until_every_live_node_has_applied_the_last() {
     let within = Duration::from_millis(500);
@@ -758,6 +762,30 @@ fn s80s4_membership_changes_refuse_until_every_live_node_has_applied_the_last() 
             && why.contains("below the newest"),
         "{why}"
     );
+    let seven = "127.0.0.7:7100";
+    let before = snapshot(&rig.rt, &*rig.store);
+    let add = |unreachable_ok: &[NodeId]| {
+        admin::add_member(
+            one,
+            rig.rt.handle(),
+            &rig.store,
+            seven,
+            None,
+            unreachable_ok,
+            within,
+        )
+    };
+    match add(&[ADDED]) {
+        Err(admin::AddNodeError::Refused(why)) => assert!(
+            why.contains("live member 3 has applied nodes/ revision"),
+            "{why}"
+        ),
+        other => panic!("node 3's held watcher refuses the add, not {other:?}"),
+    }
+    assert!(
+        snapshot(&rig.rt, &*rig.store) == before,
+        "a refused add_member writes nothing"
+    );
     rig.held.lift();
     let mut last = Ok(());
     until(
@@ -768,6 +796,8 @@ fn s80s4_membership_changes_refuse_until_every_live_node_has_applied_the_last() 
             last.is_ok()
         },
     );
+    let added = add(&[ADDED]).expect("settled, add_member adds node 7");
+    assert_eq!(added.addr, seven);
 }
 
 /// #80 S4 T11b, the mixed-version guard: five nodes run, node 6 is added (pinned by nothing,
@@ -929,7 +959,11 @@ fn s80s4_a_removed_node_loses_its_links_and_k_shrinks() {
 /// five, and its own host answers. `admin::remove_node(6)` writes `nodes/6` removed. Then node
 /// 6's `Db` reports `removed()`, its host no longer answers, and every kind of call through it
 /// is refused `INVALID_ARGUMENT`, `no_mutation`, naming the removal: a put, a get, a route, a
-/// restart of node 6 and a promote. Integration (six node processes).
+/// restart of node 6 and a promote. PR #244 review: a feed call, from the owner and from a
+/// node, and a fresh status look at nodes 1 and 2 are refused the same way, before anything is
+/// sent. Integration (six node processes).
+/// Cut (PR #244): no removal check in `changes_under` and `fresh_looks`: the feed call is
+/// dispatched and answers otherwise, red.
 ///
 /// Cuts: (a) `admin::watch_members` never marks its own node removed: "not within 10s: node
 /// 6's Db reports removed"; (b) `Db::removed` stops no node: "node 6's host has stopped". Both
@@ -1004,6 +1038,26 @@ fn s80s4_a_removed_nodes_db_stops_its_host_and_refuses_every_call() {
         &db.restart_node(ADDED)
             .expect_err("a removed Db restarts nothing"),
     );
+    for source in [Source::Owner, Source::Node(NodeId(1))] {
+        refused(
+            &format!("a feed call from {source:?}"),
+            &db.changes(PartitionId(1), crate::feed::FeedCursor::START, 10, source)
+                .expect_err("a removed Db sends no feed request"),
+        );
+    }
+    let looks = db.fresh_looks(&[NodeId(1), NodeId(2)], Duration::from_secs(1));
+    assert_eq!(looks.len(), 2, "{looks:?}");
+    for (node, look) in &looks {
+        let why = look
+            .as_ref()
+            .expect_err("a removed Db sends no status request");
+        assert!(
+            why.contains("node 6 was removed; ids are never reused")
+                && why.contains("nothing was sent"),
+            "node {}: {why}",
+            node.0
+        );
+    }
     let promote = db
         .promote_partition(PartitionId(1), NodeId(1), None)
         .expect_err("a removed Db promotes nothing");

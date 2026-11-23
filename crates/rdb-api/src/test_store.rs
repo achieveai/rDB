@@ -463,6 +463,9 @@ pub(crate) enum HoldAt {
     BeforeApply,
     /// After the store applied it, before its reply comes back.
     BeforeReply,
+    /// Not parked: applied, then answered `DeadlineExceededUnknownOutcome`, as a store whose
+    /// reply was lost (PR #244 review, `admin::freeze_grant`).
+    AppliedUnknown,
 }
 
 /// Any control store with every put of a key under one prefix parked for good at `at`, after
@@ -513,9 +516,12 @@ impl ConfigStore for PutHold {
         if !request.key.starts_with(&self.prefix) {
             return self.inner.put(request).await;
         }
-        if self.at == HoldAt::BeforeReply {
+        if self.at != HoldAt::BeforeApply {
             let applied = self.inner.put(request).await;
             tracing::info!(?applied, "test_put_hold_applied");
+        }
+        if self.at == HoldAt::AppliedUnknown {
+            return Err(ConfigError::DeadlineExceededUnknownOutcome);
         }
         tracing::info!(prefix = %String::from_utf8_lossy(&self.prefix), at = ?self.at, "test_put_held");
         self.arrived.notify_one();

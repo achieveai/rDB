@@ -77,7 +77,18 @@ pub async fn freeze_grant(
                 dedup: None,
             })
             .await
-            .map_err(|error| format!("put {key}: {error}; nothing was frozen"))?;
+            .map_err(|error| {
+                // PR #244 review: only a refusal before the log proves nothing was written; any
+                // other error (a lost reply) may have frozen it.
+                if error.is_safe_to_resubmit() {
+                    format!("put {key}: {error}; nothing was frozen")
+                } else {
+                    format!(
+                        "put {key}: {error}; the grant may be frozen: read {key}, then freeze \
+                         again"
+                    )
+                }
+            })?;
         if written.outcome == MutationOutcome::Applied {
             tracing::info!(
                 node = node.0,
@@ -307,6 +318,58 @@ pub(crate) async fn record_of(
 mod tests {
     use super::*;
     use rdb_core::placement::{Node, NodeState, Partition};
+
+    /// PR #244 review (drain.rs): a freeze write the store applied but answered with an unknown
+    /// outcome says the grant may be frozen, never that nothing was, and the store does hold it
+    /// frozen. Unit.
+    /// Cut: the old "nothing was frozen" for every put error, red.
+    #[config_log::retcd_test]
+    fn pr244_an_applied_freeze_with_an_unknown_outcome_says_the_grant_may_be_frozen() {
+        use rdb_core::contracts::ids::{AuthorityGeneration, BootId, GrantId};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let mem: std::sync::Arc<dyn ConfigStore> =
+            std::sync::Arc::new(config_testkit::MemStore::new());
+        let key = ControlKey::Grant(NodeId(2)).encode();
+        let live = GrantRecord {
+            grant: GrantId(1),
+            node: NodeId(2),
+            boot: BootId(7),
+            authority_generation: AuthorityGeneration::default(),
+            expiry_utc_ms: 1,
+            frozen: false,
+        };
+        rt.block_on(mem.put(PutRequest {
+            key: Bytes::from(key.clone()),
+            value: live.encode(),
+            expected_mod_revision: None,
+            dedup: None,
+        }))
+        .expect("the grant is written");
+        let store = crate::test_store::PutHold::new(
+            std::sync::Arc::clone(&mem),
+            "grants/",
+            crate::test_store::HoldAt::AppliedUnknown,
+        );
+        let why = rt
+            .block_on(freeze_grant(&*store, NodeId(2)))
+            .expect_err("the reply was lost");
+        assert!(
+            why.contains("the grant may be frozen") && !why.contains("nothing was frozen"),
+            "{why}"
+        );
+        let held = rt
+            .block_on(mem.get(GetRequest {
+                key: Bytes::from(key),
+            }))
+            .expect("the store answers")
+            .record
+            .and_then(|found| GrantRecord::decode(&found.value))
+            .expect("a grant");
+        assert!(held.frozen, "the write applied: {held:?}");
+    }
 
     /// Nodes 1 to 4, each on its own machine, node 2 draining; `partitions` as
     /// `(id, copies, primary)`.
