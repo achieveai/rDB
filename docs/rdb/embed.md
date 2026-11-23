@@ -1937,13 +1937,16 @@ two more short pauses (2.2 s and 1.6 s), each `LEASE_EXPIRED` then the same `UNA
   node M: the history budget overran its snapshot transfer 3 times in a row; ...". It is
   logged `history_budget_gave_up` (warn). To change the history budget, reopen the `Db` with a
   larger `history_budget_bytes`: the budget is fixed when the node starts. Reducing writes alone
-  does not clear an existing give-up. A new generation or the copy catching up clears it with no
-  restart (`history_budget_give_up_cleared`), and the copy is retried.
-  The budget is a hard cap with one exception: while a degraded rebuild runs (F1 `Rebuilding`
-  after a commit below `Active`), History is kept from that rebuild's cutoff, so it can go past
-  `history_budget_bytes` until the rebuild activates. Each round held that way logs
-  `history_trim_held_rebuild{cutoff, floor_was}` (info). The activation needs the record at the
-  cutoff, and a trim past it would make the primary refuse its own activation.
+  does not clear an existing give-up. A newer generation clears it without restart and logs
+  `history_budget_give_up_cleared`, so a later snapshot request is offered again. A caught-up
+  release also clears it, silently.
+  The budget is a hard cap except for holds: staging, installing, recovering, landing and an
+  answered inventory (up to 10 minutes). A degraded rebuild also keeps History from its cutoff
+  while F1 stays `Rebuilding`, for up to max(`history_keep`, inventory pin), 30 min at the
+  defaults. Each round held that way logs `history_trim_held_rebuild{cutoff, floor_was}`
+  (info); past the limit the cap applies again, logged once `history_trim_rebuild_hold_expired`
+  (warn). The activation needs the record at the cutoff, so a trim past it makes the primary
+  refuse its own activation.
 - **A copy that held writes past a trimmed history needs an operator** (issue #61). Shown when
   `PartitionReady.degraded` (`Db::readiness`) or a `needs_operator` in `Db::node_status()` is
   set, and by the warn `copy_needs_forget_tail{node, partition, copy, from, head, through,

@@ -1,5 +1,5 @@
 //! Issue #61 S3 (design §3.1): the History retention floor `F`, computed by one pure function
-//! that the host's trim duty calls (the simulator's twin returns under #239).
+//! that the host's trim duty calls (the simulator's twin is open in #239 and needs owner OK).
 //!
 //! ```text
 //! need = min( own_durable,

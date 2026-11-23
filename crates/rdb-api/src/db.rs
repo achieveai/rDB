@@ -273,12 +273,16 @@ pub struct DbConfig {
     ///
     /// A copy keeps more than this while something still needs it: another copy that has not
     /// acknowledged it, a snapshot transfer, a recovery, or an answered inventory (at most 10
-    /// minutes). [`Self::history_budget_bytes`] caps it all.
+    /// minutes). [`Self::history_budget_bytes`] caps the lagging copies and the transfers, not
+    /// the holds it names.
     pub history_keep: Option<Duration>,
     /// The most History each copy of a partition keeps, in bytes (issue #61, design 3.2). `None`
     /// is 20 GiB. A hard cap: it trims past a copy that has not acknowledged and past a snapshot
-    /// transfer, which then starts again (`history_budget_overran_pin`). It does not trim past
-    /// an answered inventory, so disk can pass it for at most 10 minutes of writes.
+    /// transfer, which then starts again (`history_budget_overran_pin`). The byte cap overrides
+    /// lagging copies and transfer pins, but trim is held during staging, installing,
+    /// recovering, landing and answered inventories (up to 10 minutes), and a degraded rebuild
+    /// clamps the floor to its cutoff while F1 stays `Rebuilding`, for up to
+    /// max(`history_keep`, inventory pin).
     pub history_budget_bytes: Option<u64>,
     /// The nodes whose copies this process holds and runs (M10 S2). [`ALL_NODES`] is the
     /// one-process database: all three copies here. Some of them is a node process

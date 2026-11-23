@@ -2139,7 +2139,7 @@ impl RocksEngine {
     /// An **estimate** of the bytes of `History` lineage `(partition, generation)` keeps from
     /// `from` through its applied head (issue #61 S3, lead ruling R25): the retained seqs in
     /// `[max(from, floor, 1), head]` times the partition's mean record size (the simulator's
-    /// twin returns under #239). The cost is the [`Self::floor`] walk, O(lineage levels), and,
+    /// twin is open in #239 and needs owner OK). The cost is the [`Self::floor`] walk, O(lineage levels), and,
     /// on the cold path while the partition has no learnt mean, two RocksDB property reads
     /// ([`Self::history_record_bytes`]); no record is read.
     ///

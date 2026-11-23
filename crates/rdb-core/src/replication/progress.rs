@@ -229,13 +229,17 @@ impl DigestLadder {
     ///
     /// Pops from the front while the lowest rung is below `seq`, so a trim costs the rungs it
     /// drops, not the ladder's length: a retention round runs it each time the floor moves.
-    pub fn trim_below(&mut self, seq: Seq) {
+    /// Answers the rungs it looked at: those it dropped, and the one it stopped at.
+    pub fn trim_below(&mut self, seq: Seq) -> usize {
+        let mut visited = 0;
         while let Some(lowest) = self.entries.first_entry() {
+            visited += 1;
             if *lowest.key() >= seq {
                 break;
             }
             lowest.remove();
         }
+        visited
     }
 
     /// The lowest sequence the ladder holds, or `None` when it holds nothing. After

@@ -7714,6 +7714,23 @@ fn t61_trim_below_pops_only_the_prefix_below_the_floor() {
     assert_eq!(ladder.digest_at(Seq(12)), Some(d(12)));
 }
 
+/// Issue #61 (PR #240 r4): a trim near the head of a full ladder looks at the rungs it drops
+/// and the one it stops at, not the whole ladder. 10 000 dense rungs; a trim to 9 990 drops
+/// 9 990 and looks at 9 991; the next trim, to 9 995, looks at 6.
+/// Cut: a full-map retain counting every rung (`visited = len; retain(..)`), red (6 for 10).
+/// Unit (~10 ms).
+#[retcd_test]
+fn t61_trim_below_visits_only_the_dropped_prefix() {
+    let mut ladder = DigestLadder::new();
+    for seq in 0..10_000 {
+        ladder.insert(Seq(seq), d(seq));
+    }
+    assert_eq!(ladder.trim_below(Seq(9_990)), 9_991);
+    assert_eq!(ladder.trim_below(Seq(9_995)), 6, "five dropped, one kept");
+    assert_eq!(ladder.trim_below(Seq(9_995)), 1, "nothing to drop");
+    assert_eq!((ladder.floor(), ladder.len()), (Some(Seq(9_995)), 5));
+}
+
 /// Issue #61 A3: an ACK at the floor itself counts, because History keeps the record at the
 /// floor and the ladder keeps its rung (design §0, "`seq` included"). Twice: a dense ladder
 /// trimmed to 8 keeps its rung at 8, and a ladder that held only the root and its head (what

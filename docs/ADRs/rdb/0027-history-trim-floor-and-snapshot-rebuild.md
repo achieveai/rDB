@@ -74,7 +74,8 @@ the floor).
    the byte cap (`history_budget_bytes`, default 20 GiB, a hard cap that overrides a lagging copy
    and a transfer pin) set the floor. A staging, installing, recovering or landing lineage, an
    answered inventory (for up to 10 minutes) and a failover grace hold it back; the grace yields
-   to the cap. A degraded rebuild keeps the floor at its cutoff until it activates, the cap
+   to the cap. A degraded rebuild keeps the floor at its cutoff until it activates (at most
+   max(`history_keep`, inventory pin)), the cap
    included (`history_trim_held_rebuild`), because the activation restates that cutoff. The
    debug-build dev tool `rdb_dev admin trim-history --through N`
    (`Db::trim_history`) remains for tests.
@@ -97,9 +98,10 @@ the floor).
   days (spec §8.4). They are deleted only after the offer passed the authority check, and never
   over a current #105 tail.
 - **Disk and memory are bounded by the retention duty.** History holds about the keep window,
-  and never more than the byte cap unless a hold applies: a lineage being staged, installed,
-  recovered or landed, an answered inventory for up to 10 minutes, or a degraded rebuild until
-  it activates.
+  and never more than the byte cap unless a hold applies. A trim never passes this node's own
+  durable seq. The holds: a lineage being staged, installed, recovered or landed, an answered inventory for up
+  to 10 minutes, or a degraded rebuild until it activates, for up to max(`history_keep`,
+  inventory pin).
 - `PROTOCOL_VERSION` moves to 11 (10 is issue #107's and issue #87's): the probe ask, the
   snapshot frames, `needs_operator` and `trimmed` are new wire vocabulary, and the handshake
   requires an exact match.

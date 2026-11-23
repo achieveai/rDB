@@ -4,7 +4,9 @@ use super::catchup_tests::{regular_rejoin, restart_three};
 use super::trio::{current_thread, host_over, logged, write_chain, Trio};
 use super::*;
 use rdb_core::contracts::errors::RetryRule;
-use rdb_core::replication::retention::{RetentionDecision, RetentionHold};
+use rdb_core::replication::retention::{
+    RetentionDecision, RetentionFloor, RetentionHold, RetentionInput,
+};
 
 const P: PartitionId = PartitionId(1);
 
@@ -935,7 +937,7 @@ fn t61_s3_r4b_three_overruns_in_a_row_give_up_the_copy_until_the_budget_rises() 
 /// by the first round in a newer one, logged `history_budget_give_up_cleared{why =
 /// new_generation}`, with its count. The give-up is planted at generation 0 on a host holding
 /// generation 1; making one for real and then re-planning takes a failover (the simulator's
-/// row for it returns under #239). A give-up at the same generation
+/// row for it is open in #239 and needs owner OK). A give-up at the same generation
 /// and budget stands.
 ///
 /// Cut: no `new_generation` clear, red (the give-up stands). Unit.
@@ -1424,6 +1426,27 @@ fn t61_s3_a_binding_cap_trims_during_open_failover_grace() {
         Some(second),
         "the grace is open"
     );
+    let node2 = &trio.nodes[1].0;
+    let tracker = node2
+        .replication
+        .primary(NodeId(2), P)
+        .expect("node 2's primary side")
+        .tracker();
+    let three = tracker
+        .peers()
+        .map(|(copy, _)| copy)
+        .find(|copy| {
+            tracker
+                .config()
+                .member(*copy)
+                .is_some_and(|member| member.node == NodeId(3))
+        })
+        .expect("copy 3 in node 2's configuration");
+    assert!(
+        node2.retention[&P].behind.contains(&three),
+        "the lagging copy is reported behind: {:?}",
+        node2.retention[&P].behind
+    );
     let ends: Vec<_> = logged!(METHOD, "history_grace_ended")
         .into_iter()
         .filter(|line| line["node"] == 2)
@@ -1503,30 +1526,20 @@ fn t61_s3_a_closed_grace_stays_closed_on_a_replayed_recovered() {
     assert_eq!(begun.len(), 1, "{begun:?}");
 }
 
-/// Issue #61 S3 (PR #240 r3 Q1, lead ruling option A): a byte cap does not trim past the cutoff
-/// of a degraded rebuild, so the primary can still take its own activation. The trio boots with
-/// node 3's links held: F1 commits `DegradedRf2` with nodes 1 and 2 at cutoff 0 and arms a
-/// rebuild of node 3, with the drop clocks out of reach. L1 pauses writes from that
-/// `Recovered` until node 3 catches up, so the record above the cutoff is the start record at
-/// seq 1. Node 1 has `history_budget_bytes` = 0 and keep 0, so its own schedule's cap would
-/// trim through it. While F1 is `Rebuilding` every trim is held at the cutoff
-/// (`history_trim_held_rebuild{cutoff = 0, floor_was = 1}`) and the floor stays 0. Healed, node 3 proves the
-/// point, the activation's `Recovered` (now `Active`) is taken, and the cap trims again.
-///
-/// Cut: no clamp in `clamp_at_rebuild` (an early return), red (the floor passes the cutoff to
-/// 1 while F1 rebuilds; the activation would then be refused `BarrierNotDurable`).
-/// Integration (~5 s): bootstrap, a heal and the activation.
-#[config_log::retcd_test]
-fn t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates() {
-    const METHOD: &str = "t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates";
-    let dir = config_testkit::fs::temp_dir();
-    let mut trio = Trio::new(dir.path(), |host| {
+/// The degraded-rebuild world: the trio boots with node 3's links held, so F1 commits
+/// `DegradedRf2` with nodes 1 and 2 at cutoff 0 and arms a rebuild of node 3; the drop clocks
+/// are out of reach. L1 pauses writes from that `Recovered` until node 3 catches up, so the
+/// record above the cutoff is the start record at seq 1. Every node has
+/// `history_budget_bytes` = 0, no inventory pin and `history_keep` = `keep_millis`, which is
+/// also the rebuild hold's limit. Returns once node 1's F1 is `Rebuilding`, with the lineage.
+fn degraded_rebuild(dir: &std::path::Path, keep_millis: u64) -> (Trio, Generation) {
+    let mut trio = Trio::new(dir, move |host| {
         Trio::fast(host);
         host.inventory_pin_millis = 0;
         host.peer_drop_after_millis = 600_000;
         host.unreachable_drop_after_millis = 600_000;
         host.history_retention = HistoryRetention {
-            keep_millis: 0,
+            keep_millis,
             budget_bytes: 0,
         };
     });
@@ -1536,23 +1549,53 @@ fn t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates() {
     trio.until("node 1 committed", |trio| {
         trio.nodes[0].0.committed.get(&P).map(|_| ())
     });
-    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
-    let mode = |trio: &Trio| trio.nodes[0].0.committed.get(&P).map(|c| c.mode.clone());
-    assert_eq!(mode(&trio), Some(PartitionMode::DegradedRf2));
+    assert_eq!(commit_mode(&trio), Some(PartitionMode::DegradedRf2));
     trio.until("F1 rebuilding on node 1", |trio| {
         let phase = trio.nodes[0].0.recoveries.get(&P).map(Recovery::phase);
         (phase == Some(RecoveryPhase::Rebuilding)).then_some(())
     });
+    let generation = trio.nodes[0].0.newest_held(P).expect("node 1's lineage");
+    (trio, generation)
+}
+
+/// The mode of node 1's last commit of partition 1.
+fn commit_mode(trio: &Trio) -> Option<PartitionMode> {
+    trio.nodes[0].0.committed.get(&P).map(|c| c.mode.clone())
+}
+
+/// Step the trio until `periods` retention periods have passed on its clock.
+fn retention_periods(trio: &mut Trio, periods: u64) {
+    let from = trio.clock.now();
+    trio.until("retention periods pass", |trio| {
+        (trio.clock.now() >= from.plus_millis(periods * RETENTION_DUTY_MILLIS)).then_some(())
+    });
+}
+
+/// Issue #61 S3 (PR #240 r3 Q1, lead ruling option A): a byte cap does not trim past the cutoff
+/// of a degraded rebuild, so the primary can still take its own activation. In
+/// [`degraded_rebuild`] with a 10-minute keep (the hold's limit), node 1's own schedule's cap
+/// would trim through the start record. While F1 is `Rebuilding` every trim is held at the
+/// cutoff (`history_trim_held_rebuild{cutoff = 0, floor_was = 1}`) and the floor stays 0. A
+/// floor the clamp lowers keeps only the copies below it behind and only the pins below it
+/// overran (planted, at a floor in force of 3). Healed, node 3 proves the point, the
+/// activation's `Recovered` (now `Active`) is taken, and the cap trims again.
+///
+/// Cuts: no clamp in `clamp_at_rebuild` (an early return), red (the floor passes the cutoff to
+/// 1 while F1 rebuilds; the activation would then be refused `BarrierNotDurable`); the
+/// behind filter or the overran-pin filter dropped, red.
+/// Integration (~5 s): bootstrap, a heal and the activation.
+#[config_log::retcd_test]
+fn t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates() {
+    const METHOD: &str = "t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, generation) = degraded_rebuild(dir.path(), 600_000);
     let held_lines = || {
         logged!(METHOD, "history_trim_held_rebuild")
             .into_iter()
             .filter(|line| line["node"] == 1)
             .count()
     };
-    let rebuilding = trio.clock.now();
-    trio.until("three retention periods while F1 rebuilds", |trio| {
-        (trio.clock.now() >= rebuilding.plus_millis(3 * RETENTION_DUTY_MILLIS)).then_some(())
-    });
+    retention_periods(&mut trio, 3);
     let floor = |trio: &Trio| trio.nodes[0].0.engine.floor_seq(P, generation);
     assert_eq!(floor(&trio), Seq::ZERO, "held at the rebuild's cutoff");
     assert!(held_lines() >= 2, "each round logs the hold");
@@ -1563,13 +1606,83 @@ fn t61_s3_a_byte_cap_holds_at_a_degraded_rebuilds_cutoff_until_it_activates() {
         "the cap would trim the start record, above the cutoff: {:?}",
         held[0]
     );
+    let (low, high) = (CopyId(1), CopyId(2));
+    let input = RetentionInput {
+        prev: Seq(3),
+        applied: Seq(9),
+        own_durable: DurableSeq(9),
+        transfer_pins: vec![Seq(2), Seq(4)],
+        copies: Some(vec![(low, DurableSeq(1)), (high, DurableSeq(5))]),
+        keep: Seq(9),
+        cap: Seq(9),
+        hold: None,
+    };
+    let mut lowered = RetentionFloor {
+        floor: Seq(8),
+        behind: vec![low, high],
+        overran_pins: vec![Seq(2), Seq(4)],
+    };
+    let now = trio.clock.now();
+    trio.nodes[0]
+        .0
+        .clamp_at_rebuild(P, generation, Seq(3), now, &input, &mut lowered);
+    assert_eq!(
+        lowered,
+        RetentionFloor {
+            floor: Seq(3),
+            behind: vec![low],
+            overran_pins: vec![Seq(2)],
+        },
+        "held at the floor in force: only what is below it stays behind or overran"
+    );
     trio.links.heal_all();
     trio.until("the activation reaches Active on node 1", |trio| {
-        (mode(trio) == Some(PartitionMode::Active)).then_some(())
+        (commit_mode(trio) == Some(PartitionMode::Active)).then_some(())
     });
     trio.ready();
     put_durable(&mut trio, 1);
     trio.until("the cap trims once the rebuild is done", |trio| {
         (floor(trio) > Seq::ZERO).then_some(())
     });
+}
+
+/// Issue #61 S3 (PR #240 r4): the rebuild hold is time-limited. In [`degraded_rebuild`] with a
+/// 2 s keep, node 3 never proves the point, so F1 stays `Rebuilding`. The first rounds are held
+/// at the cutoff; once `max(history_keep, inventory_pin_millis)` has passed since the watch
+/// began, the cap applies again and trims the start record, logged
+/// `history_trim_rebuild_hold_expired` once.
+///
+/// Cut: no limit in `clamp_at_rebuild`, red (the floor stays 0).
+/// Integration (~5 s): bootstrap and the limit.
+#[config_log::retcd_test]
+fn t61_s3_a_stalled_rebuild_releases_its_hold_after_the_limit() {
+    const METHOD: &str = "t61_s3_a_stalled_rebuild_releases_its_hold_after_the_limit";
+    let dir = config_testkit::fs::temp_dir();
+    let (mut trio, generation) = degraded_rebuild(dir.path(), 2_000);
+    trio.until(
+        "the hold expires and the cap trims the start record",
+        |trio| (trio.nodes[0].0.engine.floor_seq(P, generation) == Seq(1)).then_some(()),
+    );
+    let phase = trio.nodes[0].0.recoveries.get(&P).map(Recovery::phase);
+    assert_eq!(
+        phase,
+        Some(RecoveryPhase::Rebuilding),
+        "the rebuild never proved"
+    );
+    let held = logged!(METHOD, "history_trim_held_rebuild")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .count();
+    assert!(held >= 1, "the rounds before the limit were held");
+    retention_periods(&mut trio, 2);
+    let expired: Vec<_> = logged!(METHOD, "history_trim_rebuild_hold_expired")
+        .into_iter()
+        .filter(|line| line["node"] == 1)
+        .map(|line| (line["generation"].clone(), line["millis"].clone()))
+        .collect();
+    assert_eq!(
+        expired,
+        [(generation.0.into(), 2_000.into())],
+        "logged once"
+    );
 }

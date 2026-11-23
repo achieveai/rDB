@@ -13281,7 +13281,10 @@ impl Host {
         .into_iter()
         .flatten()
         {
-            kept.rungs.retain(|(seq, _)| *seq >= through);
+            // Dense and ascending: find the cut by binary search and drop the prefix, so a
+            // round looks at no rung it keeps (PR #240 r4).
+            let expired = kept.rungs.partition_point(|(seq, _)| *seq < through);
+            kept.rungs.drain(..expired);
         }
         self.dormant_ladders
             .retain(|p, ladder| *p != partition || !ladder.rungs.is_empty());

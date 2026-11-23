@@ -2,7 +2,7 @@
 //! [`RETENTION_DUTY_MILLIS`], each partition this node holds gets one round: the host gathers
 //! what [`retention_floor`] reads from its engine and kernel, and when the floor moves it trims
 //! there through `Host::trim_history_through` (R1's ladders, then the engine, then the kept
-//! ladders). The simulator's twin returns under #239.
+//! ladders). The simulator's twin is open in #239 and needs owner OK.
 //!
 //! * `prev`, `applied` and `own_durable` are the engine's, of the partition's newest lineage.
 //!   `keep` comes from this node's [`RetentionSamples`], the cap from
@@ -67,14 +67,18 @@ pub(crate) struct RetentionState {
     pub(crate) behind: BTreeSet<CopyId>,
     /// The open grace: the generation whose `Recovered` began it, and when.
     pub(crate) grace: Option<(Generation, Tick)>,
-    /// The generation the last grace began in, kept after it ends, so a replayed `Recovered`
-    /// of that generation does not open a second one (PR #240 r3: one grace per generation).
+    /// The generation the last grace began in, kept after it ends so repeating it does not
+    /// reopen grace; a different generation replaces it.
     pub(crate) graced: Option<Generation>,
+    /// The generation whose rebuild hold this node last let expire, so the expiry is logged
+    /// once ([`Host::clamp_at_rebuild`]).
+    pub(crate) rebuild_hold_expired: Option<Generation>,
     /// Per copy, the overruns in a row of its transfers from this node (issue #61 S3-R4 (b),
     /// owner ruling 2026-11-20, option 1): one more each time the cap ends one
     /// `budget_overran`, reset by any round for the copy that is not an overrun: a `caught_up`
     /// release, or a round whose floor stays at or below its open transfer's pin. A held round
-    /// decides no floor, so it neither counts nor resets. The simulator's twin returns under #239.
+    /// decides no floor, so it neither counts nor resets. The simulator's twin is open in #239
+    /// and needs owner OK.
     pub(crate) overruns: BTreeMap<CopyId, u32>,
     /// Per copy this node stopped offering at [`OverrunAction::GiveUp`]: the budget and the
     /// generation in force then, and the overruns counted. Named in `NodeStatus::needs_operator`
@@ -172,7 +176,7 @@ impl Host {
         };
         let mut decision = retention_floor(&input);
         if let RetentionDecision::Floor(floor) = &mut decision {
-            self.clamp_at_rebuild(partition, generation, prev, &input, floor);
+            self.clamp_at_rebuild(partition, generation, prev, now, &input, floor);
         }
         let floor = match &decision {
             RetentionDecision::Held(hold) => {
@@ -260,11 +264,18 @@ impl Host {
     /// would make the primary refuse its own activation. This overrides the byte cap for the
     /// length of the rebuild (lead ruling, PR #240 r3 Q1). A commit F1 armed no rebuild for (a
     /// two-copy drop, a capped commit) never activates, so it is not held.
-    fn clamp_at_rebuild(
-        &self,
+    ///
+    /// The hold lasts at most `max(history_keep, inventory_pin_millis)` from the watch's start,
+    /// the bound a grace has (PR #240 r4): a rebuild that stays unproven that long releases it
+    /// and the cap applies again, logged `history_trim_rebuild_hold_expired` once per
+    /// generation. The drop bounds (10 s) are not used: they would release before any rebuild
+    /// long enough to write past the cap.
+    pub(super) fn clamp_at_rebuild(
+        &mut self,
         partition: PartitionId,
         generation: Generation,
         prev: Seq,
+        now: Tick,
         input: &RetentionInput,
         floor: &mut RetentionFloor,
     ) {
@@ -281,6 +292,27 @@ impl Host {
         };
         let held = prev.max(watch.cutoff);
         if floor.floor <= held {
+            return;
+        }
+        let limit = self
+            .history_retention
+            .keep_millis
+            .max(self.inventory_pin_millis);
+        if now >= watch.since.plus_millis(limit) {
+            let (since, cutoff) = (watch.since, watch.cutoff);
+            let state = self.retention.entry(partition).or_default();
+            if state.rebuild_hold_expired != Some(generation) {
+                state.rebuild_hold_expired = Some(generation);
+                tracing::warn!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    cutoff = cutoff.0,
+                    since = since.0,
+                    millis = limit,
+                    "history_trim_rebuild_hold_expired"
+                );
+            }
             return;
         }
         tracing::info!(
@@ -338,7 +370,7 @@ impl Host {
     }
 
     /// The no-trim gate the duty finds on `partition`, the first that holds, or `None` (design
-    /// 3.1, "No trim while"; the simulator's twin returns under #239).
+    /// 3.1, "No trim while"; the simulator's twin is open in #239 and needs owner OK).
     ///
     /// * `Staging` / `Installing`: the newest lineage is mid copy or mid install, or this node
     ///   holds an install of the partition open.
@@ -418,8 +450,8 @@ impl Host {
     /// [`HISTORY_BUDGET_GIVE_UP_CLEARED`], so the copy's next ask is offered again. A lower or
     /// equal budget clears nothing. The budget is fixed when the node starts, so in a running
     /// node `budget_raised` is reached only by a row that sets it; the operator's remedy is a
-    /// reopen with a larger budget, which starts with no give-up. The simulator's twin returns
-    /// under #239.
+    /// reopen with a larger budget, which starts with no give-up. The simulator's twin is open
+    /// in #239 and needs owner OK.
     fn clear_give_ups(&mut self, partition: PartitionId, generation: Generation) {
         let budget_bytes = self.history_retention.budget_bytes;
         let node = self.node.0;
