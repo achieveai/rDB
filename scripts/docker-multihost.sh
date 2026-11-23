@@ -53,7 +53,11 @@
 #                   owner among its other copies; every other partition keeps its owner;
 #                K3 the untouched partitions never go longer than the put timeout unwritten;
 #                K4 every planner_promoted after the kill names a partition N owned;
-#                K5 the last acknowledged probe value of every partition reads back.
+#                K5 the last acknowledged probe value of every partition reads back;
+#                K6, only on a rig up ran with --restart-on-exit (restart label
+#                on-failure:3): when the probe ends, N is still exited 137 with the restart
+#                count it had before the kill, so Docker did not bring it back. Without
+#                the policy K6 is not run and not printed.
 #                Then N is started again: J1 ready within 60 s; J2 within --rejoin-s it is
 #                pinned regular again wherever it was, three copies each; J3 the K5 values
 #                still read back and a 5 s probe writes every partition; J4 (printed) what N
@@ -690,14 +694,16 @@ clean() {
 # The claims, read from the sessions' outputs (no Docker): `analyze MODE ARGS..`. Every mode
 # that judges prints `PASS <claim>` or `FAIL <claim>` lines, with detail lines indented, and
 # exits 0; a line it cannot read ends it with exit 2 and the line, never a guess.
-#   failover N PARTITIONS T0 PUT_MS BOUND_LINE PRE RUN POST PROMOTED READS   K1-K5
+#   failover N PARTITIONS T0 PUT_MS BOUND_LINE PRE RUN POST PROMOTED READS   K1-K5 (K6 is
+#                              killheld, below: failover runs it only under --restart-on-exit)
 #   reads PRE RUN              the get commands K5 and J3 read back, in the order they judge
 #   rejoin N PARTITIONS PRE STATUS        exit 0 when J2 holds, 1 when not yet; one line why
 #   j3 PARTITIONS PRE RUN READS AFTER     J3
 #   owned N STATUS             J4: the partitions N owns, as a line
 #   voter PARTITIONS PROBE     restart-voter's claim
 #   leader HEALTH..            the voter every answering voter names as leader, or exit 1
-#   killheld N R0 INSPECT      K6: after `docker kill`, N stayed exited 137 with R0 restarts
+#   killheld N R0 INSPECT      K6: after `docker kill`, N stayed exited 137 with R0 restarts;
+#                              failover asks it only when the restart label is on-failure:3
 #   restarted N R0 INSPECT EVENTS STDOUT   P2
 #   cleared N SINCE_MS LOGS    P4
 #   written PARTITIONS PROBE   P5
