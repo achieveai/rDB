@@ -3013,22 +3013,30 @@ fn a_restarted_peer_process_is_posted_to_the_owner_as_peer_booted() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Writes go on with node 3 away until the owner pauses them for the unheard copy (B-R38).
+    // Writes go on with node 3 away until the owner warns that node 3 lags the durable floor
+    // (#79 option A: one copy of three away no longer pauses writes; B-R38's pause is gone).
+    // A refusal that wrote nothing is sent again under a fresh id.
     let mut landed = 0u32;
-    let paused_by = std::time::Instant::now() + patience;
+    let warned_by = std::time::Instant::now() + patience;
     loop {
         match one.db.put(format!("away-{landed}").as_bytes(), b"1", None) {
             Ok(_) => landed += 1,
-            Err(e) if e.error.name() == "PROTECTION_PAUSED" => break,
+            Err(e) if e.error.no_mutation => {}
             Err(e) => panic!("a put with node 3 away, after {landed} landed: {e}"),
         }
+        config_log::layer::flush_test_logs();
+        let warned = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .iter()
+            .any(|line| line["@m"] == "copy_durable_lagging" && line["holder"] == 3);
+        if landed >= 1 && warned {
+            break;
+        }
         assert!(
-            std::time::Instant::now() < paused_by,
-            "writes never paused with node 3 away: {landed} landed"
+            std::time::Instant::now() < warned_by,
+            "node 1 never warned node 3 lagging: {landed} landed"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(landed >= 1, "no put landed with node 3 away");
     teardown.join().expect("node 3's process stops");
     let (relisten, _) = rt.block_on(config_testkit::ports::ephemeral_listener());
     let mut again = start(3, relisten);

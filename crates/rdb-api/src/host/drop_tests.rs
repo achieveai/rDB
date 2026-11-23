@@ -3076,13 +3076,12 @@ fn m10_s2_59_a_copy_past_the_cutoff_is_added_back_and_ends_caught_up() {
     let (mut trio, before) = started(dir.path(), tuned);
     kill(&trio, 3, &[1, 2]);
     let (request, _) = put_until_drop_planned(&mut trio, 1);
-    trio.until("node 1 decided to drop node 3", |trio| {
-        matches!(
-            trio.nodes[0].0.rejoins.get(&PartitionId(1)),
-            Some(Rejoin::Revoking { replan, .. } | Rejoin::Planned { replan, .. })
-                if replan.drop == Some(NodeId(3))
-        )
-        .then_some(())
+    // As b15: the drop's re-plan can commit inside the put that started it.
+    trio.until("node 1 decided to drop node 3", |_| {
+        logged!(METHOD, "rejoin_plan")
+            .iter()
+            .any(|line| line["dropped"] == "Some(3)")
+            .then_some(())
     });
     // The tail: 500 records of node 3's newest generation after its head, which no other copy
     // holds, so node 3 is past the cutoff of every commit this row makes.
