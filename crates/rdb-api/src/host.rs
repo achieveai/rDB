@@ -14974,13 +14974,13 @@ impl Host {
             );
             return;
         };
-        let Some(member) = result
+        let Some((member, pinned_boot)) = result
             .committed
             .pinned_config
             .members
             .iter()
             .find(|member| member.copy == copy)
-            .map(|member| member.node)
+            .map(|member| (member.node, member.boot))
         else {
             tracing::warn!(
                 node,
@@ -14991,6 +14991,25 @@ impl Host {
             return;
         };
         let generation = result.new_generation.0;
+        // Issue #250: a member whose link reports a boot other than the one this root pins
+        // has restarted since, possibly on an empty disk. The root is not its to land: landing
+        // it inherits from a parent the new boot may not hold, which faults the host. Its
+        // restart is the owner's to re-plan (`PeerBooted`), so nothing is re-posted.
+        if let Some(boot) = self.links.boot_of(member) {
+            if boot != pinned_boot {
+                tracing::info!(
+                    node,
+                    partition = partition.0,
+                    copy = copy.0,
+                    member = member.0,
+                    generation,
+                    boot = boot.0,
+                    pinned_boot = pinned_boot.0,
+                    "copy_ahead_rebooted"
+                );
+                return;
+            }
+        }
         let msg = Msg::Landed {
             result: result.clone(),
             partition,

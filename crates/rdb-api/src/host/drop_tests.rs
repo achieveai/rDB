@@ -11266,21 +11266,6 @@ fn t61_r3_a_copy_below_the_floor_of_a_promoted_rebuilt_copy_is_rebuilt_by_it() {
         .block_on(promote)
         .expect("the promote's task")
         .expect("the promote commits");
-    // Node 2 lands the promote's commit before its wiped restart. Restarted first, it is handed
-    // a commit pinning its old boot and faults on an inherit from a base it no longer holds
-    // (gate n1-249: `inherit_behind_cutoff`), which is not this row's subject.
-    let promoted = logged!(METHOD, "recovered")
-        .iter()
-        .rev()
-        .find(|line| line["node"] == 3)
-        .map(|line| line["generation"].clone())
-        .expect("node 3 logged the promote's recovered");
-    super::seal_tests::only_until(&mut trio, &[1, 2], "node 2 landed the promote", |_| {
-        logged!(METHOD, "recovered_landed")
-            .iter()
-            .any(|line| line["node"] == 2 && line["generation"] == promoted)
-            .then_some(())
-    });
     restart_as(&mut trio, dir.path(), 2, true);
     bind(&mut trio.nodes[1].0);
     let two = copy_of(&trio, 2);
